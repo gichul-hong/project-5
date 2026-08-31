@@ -7,6 +7,10 @@ openrouter_balance.html
 .env*.local
 *.local
 
+# Datasets & large data
+ref/dataset/
+dataset/
+
 # System & IDE files
 .DS_Store
 Thumbs.db
