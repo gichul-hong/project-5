@@ -1,75 +1,77 @@
-# 🔬 반도체 열화 이미지 복원 (Semiconductor Denoising) 프로젝트 종합 가이드
+# 🔬 삼성 DS Semiconductor Image Restoration Challenge 종합 가이드 & 개발 명세서
 
-> **본 문서는 `ref/` 디렉토리 내의 강의 자료(Day 1~3 PPTX), 실습 코드(Jupyter Notebook), 챌린지 평가 기준을 AI Agent 및 개발자가 토큰 낭비 없이 즉시 참조하여 모델을 설계·학습·평가할 수 있도록 요약·정리한 통합 개발 명세서입니다.**
+> **본 문서는 `ref/강의자료` (Day 1~3 PPTX), 실습 코드(Jupyter Notebook), 챌린지 평가 기준을 AI Agent 및 개발자가 토큰 낭비 없이 즉시 참조하여 규정을 준수하면서 고성능 모델을 개발할 수 있도록 작성된 공식 프로젝트 명세서입니다.**
 
 ---
 
-## 1. 프로젝트 개요 & 챌린지 목표
+## 📌 1. 공식 챌린지 룰 & 평가 규정 (Evaluation & Requirements)
 
-- **대회명**: 삼성 DS 과정 Digital Image Processing Challenge (Semiconductor Image Restoration)
-- **주요 과제**: 미세 반도체 공정 이미지(SEM/현미경 등)에서 발생하는 다양한 형태의 열화(Noise / Blur / Ill-posed Degradation)를 제거하고 원본 이미지를 고품질로 복원(Restoration / Denoising).
-- **최종 평가 메트릭**:
+### 1.1 데이터셋 구성 및 제약 조건 (Dataset Constraints)
+* **Train / Validation Dataset**:
+  * **Clean Images**: 총 **7,368장** 제공
+  * **Forward Corruption Model**: 2D dipole convolution (제공된 시뮬레이터 모델) + Noise model (노이즈 특성은 미제공)
+* **⚠️ 데이터 합성 생성 제한 규칙 (Data Generation Limits - 필수 준수!)**:
+  * Clean Image 1장당 **최대 6개**의 Dipole Kernel 방향(Orientations)까지만 생성 가능
+  * 각 방향(Orientation)당 **최대 2개**의 Noisy 이미지만 생성 가능
+  * ❌ **Clean Image 1장당 총 12개를 초과하는 Corrupted 이미지를 생성할 수 없음** ($6 \text{ orientations} \times 2 \text{ noises} = \text{최대 12개}$)
+* **Test Dataset**:
+  * **Corrupted Images만 100장 제공** (Sample당 1장, Clean Ground-Truth 라벨 미제공)
+  * Colab 환경에서 암호화된 평가자(Encrypted Evaluator)가 포함된 Test 코드로 실행 및 채점
+
+---
+
+### 1.2 공식 평가 메트릭 (Evaluation Metrics)
+* **정량 평가 지표**: Test 데이터셋에 대한 복원 품질 평가
   1. **PSNR (Peak Signal-to-Noise Ratio)** $\uparrow$ (높을수록 우수)
-  2. **SSIM (Structural Similarity Index)** $\uparrow$ (높을수록 우수, 1에 가까움)
-  3. **평가 방식**: Supervised(지도학습) 또는 Self-supervised(자기지도학습) 모델 적용
+  2. **SSIM (Structural Similarity Index)** $\uparrow$ (높을수록 우수)
+* **소수점 표기**: 소수점 둘째 자리에서 반올림하여 기록
 
 ---
 
-## 2. 노이즈 및 열화 모델 (Degradation Model)
+### 1.3 가산점 및 발표 평가 기준 (Bonus & Presentation)
+* **💡 부분 가산점 (Partial Bonus)**:
+  * **Label-free (Self-supervised / Unsupervised / Noise2Void / Neighbor2Neighbor 등)** 파이프라인 적용 시 부분 가산점 부여
+* **발표 평가 요건 (Presentation Requirements)**:
+  1. **전체 파이프라인의 명확한 설명** (Overall pipeline structure)
+  2. **복원 전/후 예시 결과 비교 시각화** (Before / After restoration examples)
+  3. **특정 방법론을 선택한 이유와 타당성 입증** (Justification for method choice)
 
-### 2.1 영상 열화 기본 수식
+---
+
+## 🛠️ 2. 허용되는 접근법 (Allowed Approaches)
+
+참가자는 아래의 모든 접근법을 자유롭게 탐색하고 결합할 수 있습니다:
+1. **Classical Image Processing**: 전통적 필터링, 정규화 역필터, Wiener 필터, TV(Total Variation) 정규화
+2. **End-to-End Deep Learning**: Corrupted $\rightarrow$ Clean 복원 단일 신경망
+3. **Two-Stage Approach**: 1단계 Denoising + 2단계 Deconvolution 분리 파이프라인
+4. **Self-Supervised / Label-Free Strategies (가산점 대상)**: 실제 환경에 부합하는 라벨 프리 학습 전략
+5. **Physics-Informed Approach (PINN)**: 물리적 결함 모델(2D Dipole Convolution)을 Loss 또는 Network 구조에 직접 결합
+
+---
+
+## 📐 3. 영상 열화 및 물리 모델 (Forward Degradation Model)
+
+### 3.1 기본 열화 수식
 $$g(x,y) = h(x,y) * f(x,y) + \eta(x,y)$$
-- $f(x,y)$: 원본 클린 이미지 (Ground Truth)
-- $h(x,y)$: PSF (Point Spread Function / Blur Kernel)
-- $\eta(x,y)$: 부가 노이즈 (Additive Noise)
-- $g(x,y)$: 열화된 관측 이미지 (Degraded Image)
+- $f(x,y)$: 원본 클린 이미지 (Ground Truth, 7,368장)
+- $h(x,y)$: 2D Dipole Convolution Kernel (PSF / IRF)
+- $\eta(x,y)$: 미지의 부가 노이즈 (Gaussian, Rician, Uniform, Salt & Pepper 등)
+- $g(x,y)$: 관측된 열화 이미지 (Test 100장)
 
-### 2.2 발생 가능한 노이즈 분포 (Day 1 강의 내용)
-1. **Gaussian Noise**: 전자 장비의 열 잡음(Thermal Noise) 형태 $\rightarrow$ 정규분포 ($\sigma \in [0.0, 0.1]$)
-2. **Rician Noise**: 저신호 영역에서 왜곡이 발생하는 노이즈 ($\sigma \in [0.0, 0.15]$)
-3. **Uniform Noise**: 균일 분포 노이즈 ($\sigma \in [0.0, 0.2]$)
-4. **Salt & Pepper Noise**: 극단값(0 또는 1)이 점 형태로 나타나는 충동성 노이즈 ($\sigma \in [0.0, 0.2]$)
-
----
-
-## 3. 핵심 복원 접근법
-
-### 3.1 전통적 필터링 (Conventional Methods)
-- **Mean / Median Filter**: 국소 영역 평균/중앙값 기반 노이즈 제거 (엣지가 뭉개지는 한계)
-- **Inverse Filter**: $F(u,v) \approx G(u,v) / H(u,v)$ ($H(u,v) \approx 0$ 부근에서 노이즈 폭발 문제)
-- **Wiener Filter**: 최소 평균 제곱 오차(MMSE) 기반 필터링 (파라미터 튜닝 필요)
-
-### 3.2 딥러닝 기반 복원 (Deep Learning / PINN)
-- **DnCNN (Deep Convolutional Neural Network for Denoising)**
-  - Residual Learning: 입력 이미지에서 **노이즈 성분 $\eta(x,y)$만을 예측**하도록 학습
-  - 수식: $\hat{f}(x,y) = g(x,y) - \mathcal{R}(g(x,y))$ (여기서 $\mathcal{R}$은 신경망)
-  - 구조: `Conv + ReLU` $\rightarrow$ 다중 `Conv + BatchNorm + ReLU` $\rightarrow$ `Conv`
-- **U-Net / Multi-scale Architectures**:
-  - 인코더-디코더 구조 + Skip Connection으로 고주파수 세부 디테일 보존
-- **최신 복원 모델 확장 아이디어**:
-  - NAFNet, Restormer, SCUNet 등 최신 Denoising SOTA 아키텍처 도입 가능
-  - Loss 함수 조합: $\mathcal{L}_{total} = \mathcal{L}_{L1} + \lambda_{1} \mathcal{L}_{SSIM} + \lambda_{2} \mathcal{L}_{Perceptual}$
+### 3.2 Fourier 공간에서의 역문제(Inverse Problem) 특성
+$$\mathcal{F}\{g\} = \mathcal{F}\{h\} \cdot \mathcal{F}\{f\} + \mathcal{F}\{\eta\}$$
+* Dipole Kernel의 Fourier 변환은 Zero-cone 표면에서 0의 값을 가집니다.
+* 단순 $1 / \mathcal{F}\{h\}$ 나눗셈은 **0으로 나누기(Division by zero)** 및 노이즈 급격 증폭을 유발하는 **Ill-posed Problem**입니다.
 
 ---
 
-## 4. 실습 코드 파이프라인 분석 (`ref/code_denoising/`)
+## 🧪 4. 베이스라인 실습 코드 파이프라인 (`ref/code_denoising/`)
 
-### 4.1 데이터 로더 및 노이즈 주입 파이프라인
+### 4.1 기본 DnCNN 베이스라인 아키텍처
 ```python
-# train_denoising_example.ipynb 발췌 요약
-NOISE_RANGES = {
-    "gaussian": (0.0, 0.1),
-    "rician": (0.0, 0.15),
-    "uniform": (0.0, 0.2),
-    "salt_and_pepper": (0.0, 0.2),
-}
+import torch
+import torch.nn as nn
 
-# 학습 시 각 배치마다 4종 노이즈 중 무작위 선택하여 Ground Truth 이미지에 합성 노이즈를 얹어 Pair 생성
-# 입력 데이터: *.npy 형식의 [0, 1] 범위 정규화된 2D 이미지
-```
-
-### 4.2 기본 베이스라인 모델: DnCNN
-```python
 class DnCNN(nn.Module):
     def __init__(self, depth=17, n_channels=64, in_channels=1, out_channels=1):
         super(DnCNN, self).__init__()
@@ -88,39 +90,40 @@ class DnCNN(nn.Module):
 
     def forward(self, x):
         noise = self.dncnn(x)
-        return x - noise # Residual learning: 원본 복원
+        return x - noise # Residual learning (예측된 노이즈 제거)
 ```
 
-### 4.3 하이퍼파라미터 기본값
-- **Optimizer**: Adam ($lr = 1e-4$, decay rate $0.88$)
-- **Loss**: L2 loss 또는 L1 loss
-- **Batch Size**: 16 (Train), 1 (Val)
-- **Input Dimension**: Single channel grayscale ($1 \times H \times W$)
+### 4.2 기본 학습 파라미터 (Example Config)
+- **Batch Size**: Train 16, Validation 1
+- **Optimizer**: Adam ($lr=1e-4$, decay rate $0.88$)
+- **Loss**: L2 / L1 Loss
+- **Noise Simulation Ranges**:
+  - Gaussian: $\sigma \in [0.0, 0.1]$
+  - Rician: $\sigma \in [0.0, 0.15]$
+  - Uniform: $\sigma \in [0.0, 0.2]$
+  - Salt & Pepper: $\sigma \in [0.0, 0.2]$
 
 ---
 
-## 5. 파싱된 원본 자료 맵 (Parsed Files Map)
+## 🚀 5. Agent 개발 전략 및 고득점 체크리스트
 
-상세 내용이 필요할 때 아래 마크다운 파일들을 개별 열람할 수 있습니다:
-
-| 파일 경로 | 원본 파일 | 내용 요약 |
-|---|---|---|
-| [ref/parsed_markdown/삼성 DS Project description Day 1.md](file:///C:/hong/project-5/ref/parsed_markdown/삼성%20DS%20Project%20description%20Day%201.md) | Day 1 PPTX | 열화 모델, 노이즈 종류 및 통계적 특성, 기초 필터 |
-| [ref/parsed_markdown/삼성 DS Project description Day 2.md](file:///C:/hong/project-5/ref/parsed_markdown/삼성%20DS%20Project%20description%20Day%202.md) | Day 2 PPTX | Deconvolution, Ill-posed Inverse Problem, Wiener Filter, 정규화 기법 |
-| [ref/parsed_markdown/삼성 DS Project description Day 3.md](file:///C:/hong/project-5/ref/parsed_markdown/삼성%20DS%20Project%20description%20Day%203.md) | Day 3 PPTX | PINN (Physics-Informed), 딥러닝 기반 디컨볼루션, 일반화(Generalization) 성능 개선 |
-| [ref/parsed_markdown/train_denoising_example.md](file:///C:/hong/project-5/ref/parsed_markdown/train_denoising_example.md) | train_denoising_example.ipynb | 전체 학습 파이프라인 코드 (데이터 로더, 모델, 트레이닝 루프) |
-| [ref/parsed_markdown/test_denoising.md](file:///C:/hong/project-5/ref/parsed_markdown/test_denoising.md) | test_denoising.ipynb | 테스트/검증 평가 및 Baseline(Mean, Median) 성능 비교 코드 |
+1. **데이터 생성 규칙 준수 검증**:
+   - Clean 1장당 Orientation $\le 6$, Noise $\le 2$, 총 $\le 12$장 생성 규칙을 초과하지 않는 데이터로더 구현.
+2. **복합 손실 함수 설계**:
+   - $\mathcal{L}_{total} = \mathcal{L}_{L1} + \lambda_{SSIM} \mathcal{L}_{SSIM} + \lambda_{Edge} \mathcal{L}_{Sobel}$
+3. **SOTA 복원 아키텍처 적용**:
+   - NAFNet (Nonlinear Activation Free Network), Restormer, U-Net with Residual Blocks
+4. **Self-Supervised / Label-Free 모듈 추가**:
+   - 가산점 획득을 위한 Self-Supervised / Zero-Shot 복원 전략 구현 및 비교 분석
+5. **정량 & 정성 비교 시각화 자동화**:
+   - Test 100장에 대한 PSNR/SSIM 평가 및 Before/After 비교 이미지 저장 스크립트 작성
 
 ---
 
-## 6. 모델 성능 향상을 위한 권장 개발 전략 (Agent 개발 지침)
+## 📂 6. 파싱된 원본 자료 상세 색인
 
-1. **아키텍처 고도화**:
-   - 단순 DnCNN(17 layers)에서 **U-Net 기반 Residual Denoising**, **NAFNet(Nonlinear Activation Free)**, **Restormer** 등으로 확장.
-2. **손실 함수(Loss) 개선**:
-   - $L_2$ Loss 단독 사용 시 발생하는 Blurry 효과를 방지하기 위해 **$L_1 + \text{SSIM Loss} + \text{Edge/Sobel Loss}$** 조합 적용.
-3. **데이터 증강 (Data Augmentation)**:
-   - Random Crop, Flip, Rotation ($90^\circ, 180^\circ, 270^\circ$).
-   - 복합 노이즈(Gaussian + Salt & Pepper 혼합)에 대한 강건성 확보.
-4. **Self-Supervised / Blind Denoising 고려**:
-   - Noise2Noise, Noise2Void, Neighbor2Neighbor 기법 적용 검토.
+- [삼성 DS Project description Day 1.md (Slide 24~30 평가 및 규칙 상세)](file:///C:/hong/project-5/ref/parsed_markdown/삼성%20DS%20Project%20description%20Day%201.md#L200-L279)
+- [삼성 DS Project description Day 2.md (Deconvolution 수식 및 역필터 이론)](file:///C:/hong/project-5/ref/parsed_markdown/삼성%20DS%20Project%20description%20Day%202.md)
+- [삼성 DS Project description Day 3.md (PINN, 딥러닝 일반화, QSMnet 구조)](file:///C:/hong/project-5/ref/parsed_markdown/삼성%20DS%20Project%20description%20Day%203.md)
+- [train_denoising_example.md (Colab 학습 파이프라인 전체)](file:///C:/hong/project-5/ref/parsed_markdown/train_denoising_example.md)
+- [test_denoising.md (Encrypted Evaluator 및 Baseline 비교)](file:///C:/hong/project-5/ref/parsed_markdown/test_denoising.md)
