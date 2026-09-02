@@ -1,0 +1,1857 @@
+# %% Cell 0 [markdown]
+# Dipole deconvolution + denoising — claude-final iter1
+
+`ref/code_denoising+deconv/train_final_example.ipynb` 스켈레톤을 실행 가능한 형태로 완성한 노트북이다.
+Colab GPU 에서 위에서 아래로 순서대로 실행한다.
+
+## 실측으로 확인한 사실 (이 노트북의 설계 근거)
+
+| 항목 | 확인 결과 |
+|---|---|
+| forward model | `dipole_forward(label)` 이 `test_deconv_only` 와 **max err 1.9e-07** 로 일치 |
+| B0 방향 | `test_deconv_only/forward_meta.json` 의 `B0_dir` 이 **전부 `(0, 1)`** (단일 방향) |
+| 열화 순서 | **dipole conv → noise**. `test_deconv_noise − test_deconv_only` 잔차가 noise 통계와 일치 |
+| 잔차 검증 | gaussian `std≈σ`, uniform `std≈σ/√3`, rician 양의 bias, S&P sparse impulse |
+| noise 분포 | test 100장 = gaussian/rician/uniform/salt_and_pepper **각 25장** |
+| 데이터 | train 7,268 (L1 3,167 / L8 4,101) · val 100 (L1 43 / L8 57) · test 100 (**전부 L1**) |
+| 제공 ckpt | `Unet(chans=64, num_pool_layers=4)`, 13,431,233 params. `spec.target="label"`, `clean_branch_prob=0.5`, 100 epoch, batch 64, lr 2e-4, L2 |
+
+## 이 노트북이 하는 일
+
+1. Drive 데이터를 **`/content` SSD 로 packed `.npy` 캐시**로 복사 (epoch 마다 Drive I/O 제거)
+2. forward model 자기검증 (제공 데이터와 대조)
+3. conventional baseline: mean/median/adaptive + Wiener, `K` 는 validation sweep
+4. 학습 3종
+   - **A. `unet_e2e`** : measure → label (제공 ckpt 와 동일 구조, 재현/비교용)
+   - **B. `dncnn_blur`** : measure → `Ax` 로 denoise 학습 + Wiener deconvolution
+   - **C. `phys_unet`** : Wiener 해석해를 입력 채널·residual base 로 주는 physics-informed U-Net
+5. test 100장 평가 → noise type 별 PSNR/SSIM, error map, zoom-in
+
+## 이전 iteration 에서 가져온 설계 결정
+
+| 결정 | 근거 |
+|---|---|
+| **cosine LR** (exp decay 아님) | `claude/iter1_review.md` 2.2 — `0.88^ep` 는 성능이 오르는 중에 LR 을 죽인다 |
+| **층화 validation** (4 noise × σ 3층 전수) | `claude/iter3_review.md` 8 — 무작위 추첨 val 은 run 간 비교가 불가능했다 |
+| **고정 variant pool 12장/clean** | `claude/iter2_review.md` 5 — on-the-fly 60 epoch 은 규칙 상한(12)의 5배 |
+| **Wiener base + residual + zero-init** | `gemini-deconvolution/iter2_review.md` — 국소 CNN 에 전역 푸리에 역연산을 맡기면 실패(25.6 dB), 해석해를 주면 78 dB |
+| **flip TTA only** | dipole kernel 은 `X²`,`Y²` 의 짝함수라 flip 에 등변, rot90 은 불가 |
+
+# %% Cell 1 [markdown]
+## 0. 환경 준비
+
+# %% Cell 2 [code]
+# Colab 이면 Drive mount, 로컬이면 건너뛴다
+try:
+    from google.colab import drive
+
+    drive.mount("/content/drive")
+    IN_COLAB = True
+except Exception as err:
+    print(f"Colab 환경이 아니다 ({type(err).__name__}). Drive mount 를 건너뛴다.")
+    IN_COLAB = False
+
+# %% Cell 3 [code]
+import glob
+import json
+import math
+import os
+import random
+import shutil
+import tempfile
+import time
+import warnings
+import zlib
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from enum import Enum, IntEnum
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Literal
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from torch import Tensor, nn
+from torch.nn import functional
+from torch.optim import Adam, AdamW
+from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+
+warnings.filterwarnings("ignore")
+
+# ---- ROOT 자동 탐색: dataset/train 을 가진 디렉토리를 찾는다 ----
+CANDIDATES = [
+    Path("/content/drive/MyDrive/DS2026/20260831-pjt5-이종호/실습"),
+    Path("/content/drive/MyDrive/실습프로젝트"),
+    Path("/content/drive/MyDrive"),
+    Path("C:/hong/project-5/ref"),
+    Path.cwd() / "ref",
+    Path.cwd(),
+    Path.cwd().parent / "ref",
+]
+
+ROOT = None
+for _c in CANDIDATES:
+    if (_c / "dataset" / "train").is_dir():
+        ROOT = _c
+        break
+if ROOT is None:
+    for _c in CANDIDATES:
+        if not _c.exists():
+            continue
+        for _hit in _c.glob("**/dataset/train"):
+            ROOT = _hit.parent.parent
+            break
+        if ROOT is not None:
+            break
+if ROOT is None:
+    raise FileNotFoundError(f"dataset/train 을 찾지 못했다. CANDIDATES 를 수정할 것: {CANDIDATES}")
+
+DATA_SRC = ROOT / "dataset"
+WORK_ROOT = ROOT / "claude-final"
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
+
+# packed cache 는 항상 로컬 SSD 에 둔다 (Colab: /content)
+CACHE_DIR = Path("/content/cache") if IN_COLAB else Path(tempfile.gettempdir()) / "pjt5_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+print("ROOT     :", ROOT)
+print("DATA_SRC :", DATA_SRC)
+print("WORK_ROOT:", WORK_ROOT, "(ckpt/log 저장)")
+print("CACHE_DIR:", CACHE_DIR, "(학습 중 읽는 곳)")
+print("GPU      :", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "없음 (CPU)")
+
+# %% Cell 4 [code]
+# ---- 상수: 조교 제공 코드와 동일하게 유지한다 ----
+VOXEL_SIZE: tuple[float, float] = (1.0, 1.0)
+B0_DIR: tuple[float, float] = (0.0, 1.0)  # 실측 확인: test 전체가 (0, 1)
+
+NOISE_RANGES: dict[str, tuple[float, float]] = {
+    "gaussian": (0.0, 0.1),
+    "rician": (0.0, 0.15),
+    "uniform": (0.0, 0.2),
+    "salt_and_pepper": (0.0, 0.2),
+}
+NOISE_NAMES: list[str] = list(NOISE_RANGES.keys())
+
+# 규칙: clean 1장당 orientation ≤ 6, orientation 당 noise ≤ 2 → corrupted ≤ 12
+RULE_MAX_VARIANTS: int = 12
+
+
+@dataclass
+class Config:
+    # split
+    train_split: str = "train"
+    valid_split: str = "val"
+    test_measure_split: str = "test_deconv_noise"
+    test_label_split: str = "test_label"
+    test_blur_split: str = "test_deconv_only"  # forward model 자기검증용 (없어도 됨)
+
+    # 데이터 생성 규칙
+    variant_mode: Literal["pool", "onthefly"] = "pool"
+    variant_pool: int = RULE_MAX_VARIANTS
+
+    # validation (층화)
+    valid_l1_only: bool = True
+    val_sigma_levels: int = 3
+    valid_batch: int = 16
+
+    # 학습 공통
+    num_workers: int = 2
+    amp: bool = True
+    clip_output: bool = True
+    seed: int = 1234
+
+    # 빠른 스모크 테스트
+    max_train_images: int | None = None
+
+    device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+
+config = Config()
+if os.name == "nt":
+    config.num_workers = 0  # Windows 로컬에서는 worker 가 자주 멈춘다
+
+torch.manual_seed(config.seed)
+np.random.seed(config.seed)
+random.seed(config.seed)
+torch.backends.cudnn.benchmark = True
+
+print("device:", config.device)
+for _k, _v in asdict(config).items():
+    print(f"  {_k}: {_v}")
+
+# %% Cell 5 [markdown]
+## 1. Drive → `/content` SSD packed 캐시
+
+Drive 에서 `.npy` 를 7,468번 개별로 여는 것이 학습 속도의 가장 큰 병목이다.
+한 번만 순차로 읽어 **하나의 `(N, 256, 256) float32 memmap** 으로 합쳐두면
+이후 모든 epoch 이 로컬 SSD 의 memmap 슬라이싱으로 끝난다.
+
+- `train` 7,268장 → 약 1.9 GB
+- 이미 캐시가 있으면 건너뛴다 (`force=True` 로 재생성)
+
+# %% Cell 6 [code]
+def build_cache(split: str, out_name: str | None = None, force: bool = False) -> tuple[Path, Path] | None:
+    # DATA_SRC/split/*.npy 를 하나의 packed .npy + names.json 으로 만든다
+    out_name = out_name or split
+    npy_path = CACHE_DIR / f"{out_name}.npy"
+    names_path = CACHE_DIR / f"{out_name}_names.json"
+
+    src = DATA_SRC / split
+    if not src.is_dir():
+        print(f"[skip] {split}: 디렉토리 없음")
+        return None
+
+    files = sorted(src.glob("*.npy"))
+    if not files:
+        # 한 단계 더 깊게 배포된 경우 (예: test_noise_only/test_noise_only/*.npy)
+        nested = src / split
+        files = sorted(nested.glob("*.npy")) if nested.is_dir() else []
+    if not files:
+        print(f"[skip] {split}: npy 없음")
+        return None
+
+    if npy_path.exists() and names_path.exists() and not force:
+        names = json.loads(names_path.read_text(encoding="utf-8"))
+        if len(names) == len(files):
+            print(f"[cached] {out_name}: {len(names)}장")
+            return npy_path, names_path
+
+    probe = np.load(files[0]).squeeze()
+    h, w = probe.shape
+    arr = np.lib.format.open_memmap(npy_path, mode="w+", dtype=np.float32, shape=(len(files), h, w))
+    for i, f in enumerate(tqdm(files, desc=f"cache {out_name}", unit="img")):
+        arr[i] = np.load(f).squeeze().astype(np.float32)
+    arr.flush()
+    del arr
+
+    names_path.write_text(json.dumps([f.name for f in files], ensure_ascii=False), encoding="utf-8")
+    size_gb = npy_path.stat().st_size / 1024**3
+    print(f"[built] {out_name}: {len(files)}장 {h}x{w} → {npy_path} ({size_gb:.2f} GB)")
+    return npy_path, names_path
+
+
+t0 = time.time()
+build_cache(config.train_split)
+build_cache(config.valid_split)
+build_cache(config.test_measure_split, "test_measure")
+build_cache(config.test_label_split, "test_label")
+build_cache(config.test_blur_split, "test_blur")  # 없으면 skip
+
+# noise_meta.json 은 결과 분석에만 쓴다 (학습에는 사용 금지)
+for _meta_split, _meta_name in [(config.test_measure_split, "noise_meta.json")]:
+    _src_meta = DATA_SRC / _meta_split / _meta_name
+    if _src_meta.exists():
+        shutil.copy2(_src_meta, CACHE_DIR / _meta_name)
+        print(f"[copy] {_meta_name}")
+print(f"캐시 준비 완료: {time.time() - t0:.1f}s")
+
+# %% Cell 7 [code]
+class PackedSplit:
+    # packed .npy memmap + 파일명 리스트. worker 마다 lazy 하게 열어 fork 안전성을 확보한다
+    def __init__(self, name: str, l1_only: bool = False, limit: int | None = None) -> None:
+        self.npy_path = CACHE_DIR / f"{name}.npy"
+        names = json.loads((CACHE_DIR / f"{name}_names.json").read_text(encoding="utf-8"))
+        idx = list(range(len(names)))
+        if l1_only:
+            idx = [i for i in idx if names[i].startswith("L1_")]
+        if limit is not None:
+            idx = idx[:limit]
+        self.index = idx
+        self.names = [names[i] for i in idx]
+        self._mm: np.ndarray | None = None
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def get(self, i: int) -> np.ndarray:
+        if self._mm is None:
+            self._mm = np.load(self.npy_path, mmap_mode="r")
+        return np.asarray(self._mm[self.index[i]])
+
+    def name_to_pos(self) -> dict[str, int]:
+        return {n: i for i, n in enumerate(self.names)}
+
+
+_p = PackedSplit(config.train_split)
+print(f"train {len(_p)}장 | L1 {sum(n.startswith('L1_') for n in _p.names)} / L8 {sum(n.startswith('L8_') for n in _p.names)}")
+_v = PackedSplit(config.valid_split)
+print(f"val   {len(_v)}장 | L1 {sum(n.startswith('L1_') for n in _v.names)} / L8 {sum(n.startswith('L8_') for n in _v.names)}")
+_tm, _tl = PackedSplit("test_measure"), PackedSplit("test_label")
+print(f"test  measure {len(_tm)}장 / label {len(_tl)}장 | 파일명 일치: {_tm.names == _tl.names}")
+_s = _p.get(0)
+print(f"sample: {_s.shape} {_s.dtype} range [{_s.min():.3f}, {_s.max():.3f}]")
+del _p, _v, _tm, _tl
+
+# %% Cell 8 [markdown]
+## 2. Forward model : dipole convolution → noise
+
+$$y = \mathcal{N}\big(\underbrace{\mathcal{F}^{-1}\{D(k)\,\mathcal{F}\{x\}\}}_{\text{dipole convolution}}\big),\qquad
+D(k) = \frac{1}{3} - \frac{(k\cdot\hat{B_0})^2}{|k|^2}$$
+
+조교 제공 코드와 **완전히 동일한 구현**을 쓴다. 아래 셀에서 제공 데이터와 대조해 검증한다.
+
+`B0_dir=(0,1)` 이므로 magic angle(약 54.7도) 원뿔에서 `D≈0` 이고 그 주파수 성분은 원리적으로 복원 불가능하다.
+단 분모의 `+1e-8` 때문에 정확히 0 은 아니다.
+
+# %% Cell 9 [code]
+@lru_cache(maxsize=16)
+def dipole_kernel(
+    matrix_size: tuple[int, int],
+    voxel_size: tuple[float, float] = VOXEL_SIZE,
+    B0_dir: tuple[float, float] = B0_DIR,
+) -> torch.Tensor:
+    y = np.arange(-matrix_size[1] / 2, matrix_size[1] / 2, 1)
+    x = np.arange(-matrix_size[0] / 2, matrix_size[0] / 2, 1)
+    Y, X = np.meshgrid(y, x)
+
+    X = X / (matrix_size[0] * voxel_size[0])
+    Y = Y / (matrix_size[1] * voxel_size[1])
+
+    D = 1 / 3 - (X * B0_dir[0] + Y * B0_dir[1]) ** 2 / (X**2 + Y**2 + 1e-8)
+    D = np.fft.fftshift(D)
+    return torch.tensor(D, dtype=torch.float32)
+
+
+def dipole_forward(img: Tensor) -> Tensor:
+    kernel = dipole_kernel(tuple(img.shape[-2:])).to(img.device)
+    img_k = torch.fft.fftn(img.float(), dim=(-2, -1))
+    return torch.fft.ifftn(img_k * kernel, dim=(-2, -1)).real
+
+
+dipole_adjoint = dipole_forward  # D 가 real·even 이므로 A^T = A
+
+_D = dipole_kernel((256, 256))
+print(f"D range [{_D.min():.4f}, {_D.max():.4f}]")
+print(f"|D| < 0.01  비율 {float((_D.abs() < 0.01).float().mean()) * 100:.2f}%")
+print(f"|D| 최솟값  {float(_D.abs().min()):.3e}  (0 이 아니므로 원리적으로는 가역)")
+
+# %% Cell 10 [code]
+class NoisyType(str, Enum):
+    Gaussian = "gaussian"
+    Rician = "rician"
+    Uniform = "uniform"
+    SaltAndPepper = "salt_and_pepper"
+
+    @classmethod
+    def from_string(cls, value: str) -> "NoisyType":
+        try:
+            return cls(value)
+        except ValueError as err:
+            raise ValueError(f"Invalid NoisyType value: {value}. Must be one of {list(cls)} : {err}") from err
+
+
+Gen = torch.Generator | None
+
+
+def gaussian_noise(img: Tensor, sigma: float, generator: Gen = None) -> Tensor:
+    noise = torch.empty_like(img).normal_(0.0, 1.0, generator=generator) * sigma
+    return img + noise
+
+
+def rician_noise(img: Tensor, sigma: float, generator: Gen = None) -> Tensor:
+    noise_real = torch.empty_like(img).normal_(0.0, 1.0, generator=generator) * sigma
+    noise_imag = torch.empty_like(img).normal_(0.0, 1.0, generator=generator) * sigma
+    return torch.abs(img + noise_real + 1j * noise_imag)
+
+
+def uniform_noise(img: Tensor, sigma: float, generator: Gen = None) -> Tensor:
+    return img + (torch.empty_like(img).uniform_(0.0, 1.0, generator=generator) * 2.0 - 1.0) * sigma
+
+
+def salt_and_pepper_noise(img: Tensor, sigma: float, generator: Gen = None) -> Tensor:
+    salt_prob = sigma / 2
+    pepper_prob = sigma / 2
+    noisy_img = img.clone()
+    total_pixels = img.numel()
+
+    num_salt = int(total_pixels * salt_prob)
+    coords = [torch.randint(0, dim, (num_salt,), generator=generator) for dim in img.shape]
+    noisy_img[tuple(coords)] = img.max()
+
+    num_pepper = int(total_pixels * pepper_prob)
+    coords = [torch.randint(0, dim, (num_pepper,), generator=generator) for dim in img.shape]
+    noisy_img[tuple(coords)] = 0
+
+    return noisy_img
+
+
+NOISE_FUNC: dict[NoisyType, Callable[..., Tensor]] = {
+    NoisyType.Gaussian: gaussian_noise,
+    NoisyType.Rician: rician_noise,
+    NoisyType.Uniform: uniform_noise,
+    NoisyType.SaltAndPepper: salt_and_pepper_noise,
+}
+
+
+class NoiseSimulator:
+    # noise 종류 하나 + sigma 하나를 고정해서 적용한다
+    def __init__(self, noisy_type: NoisyType, sigma: float) -> None:
+        self.noisy_type = noisy_type
+        self.sigma = sigma
+
+    def __call__(self, img: Tensor, generator: Gen = None) -> Tensor:
+        return NOISE_FUNC[self.noisy_type](img, self.sigma, generator)
+
+
+def apply_noise(img: Tensor, noise_type: str, sigma: float, seed: int | None = None) -> Tensor:
+    gen = None if seed is None else torch.Generator().manual_seed(int(seed) % (2**63 - 1))
+    return NoiseSimulator(NoisyType.from_string(noise_type), sigma)(img, gen)
+
+
+def degrade(label2d: Tensor, noise_type: str, sigma: float, seed: int | None = None) -> tuple[Tensor, Tensor]:
+    # label(2D) -> (blur = Ax, measure = N(Ax)).  실측 확인된 순서: dipole conv -> noise
+    blur = dipole_forward(label2d)
+    measure = apply_noise(blur, noise_type, sigma, seed)
+    return blur, measure
+
+
+print("noise 함수 4종 등록 완료:", [n.value for n in NoisyType])
+
+# %% Cell 11 [markdown]
+### 2-1. Forward model 자기검증
+
+내 `degrade()` 가 조교가 배포한 데이터를 재현하는지 대조한다. 이게 틀리면 학습 전체가 무의미하다.
+
+1. `dipole_forward(test_label)` vs `test_deconv_only` → 일치해야 한다
+2. `test_deconv_noise − test_deconv_only` 잔차 통계 vs `noise_meta.json` 의 선언값
+   - gaussian: `std ≈ σ`
+   - uniform: `std ≈ σ/√3`
+   - rician: 양의 bias
+   - salt_and_pepper: sparse impulse
+
+# %% Cell 12 [code]
+_tl = PackedSplit("test_label")
+_tm = PackedSplit("test_measure")
+_tb_path = CACHE_DIR / "test_blur.npy"
+
+NOISE_META_PATH = CACHE_DIR / "noise_meta.json"
+TEST_NOISE_META: dict[str, dict] = {}
+if NOISE_META_PATH.exists():
+    TEST_NOISE_META = {m["file"]: m for m in json.loads(NOISE_META_PATH.read_text(encoding="utf-8"))}
+    from collections import Counter
+
+    print("test noise 분포:", dict(Counter(m["noise_type"] for m in TEST_NOISE_META.values())))
+
+if _tb_path.exists():
+    _tb = PackedSplit("test_blur")
+    _pos = _tb.name_to_pos()
+    print()
+    print("[1] dipole_forward(label) vs test_deconv_only")
+    for _n in _tl.names[:5]:
+        lab = torch.from_numpy(_tl.get(_tl.name_to_pos()[_n]))
+        only = torch.from_numpy(_tb.get(_pos[_n]))
+        sim = dipole_forward(lab)
+        err = (sim - only).abs()
+        print(f"  {_n[:24]} max_err={err.max():.3e}  rmse={err.pow(2).mean().sqrt():.3e}")
+
+    print()
+    print("[2] measure - blur 잔차 통계 vs noise_meta")
+    print(f"  {'file':<26}{'type':<18}{'sigma':>8}{'resid_std':>11}{'resid_mean':>12}{'expected_std':>14}")
+    for _n in _tl.names[:8]:
+        only = torch.from_numpy(_tb.get(_pos[_n]))
+        noisy = torch.from_numpy(_tm.get(_tm.name_to_pos()[_n]))
+        r = noisy - only
+        meta = TEST_NOISE_META.get(_n, {})
+        nt, sg = meta.get("noise_type", "?"), meta.get("sigma", float("nan"))
+        exp = {"gaussian": sg, "uniform": sg / math.sqrt(3), "rician": sg, "salt_and_pepper": float("nan")}.get(nt, float("nan"))
+        print(f"  {_n[:24]:<26}{nt:<18}{sg:>8.4f}{r.std():>11.4f}{r.mean():>+12.4f}{exp:>14.4f}")
+    del _tb
+else:
+    print("test_deconv_only 가 없어 [1],[2] 검증을 건너뛴다 (학습에는 영향 없음)")
+
+print()
+print("[3] 내 apply_noise 재현성 확인 (같은 seed → 같은 결과)")
+_x = torch.from_numpy(_tl.get(0))
+for _nt in NOISE_NAMES:
+    a = apply_noise(_x, _nt, 0.1, seed=42)
+    b = apply_noise(_x, _nt, 0.1, seed=42)
+    c = apply_noise(_x, _nt, 0.1, seed=43)
+    print(f"  {_nt:<18} seed 동일→max diff {float((a - b).abs().max()):.2e} | seed 다름→mean|a-c| {float((a - c).abs().mean()):.4f}")
+del _tl, _tm
+
+# %% Cell 13 [markdown]
+## 3. Metric (PSNR / SSIM)
+
+조교 제공 구현을 **그대로** 쓴다. 채점 코드와 동일해야 하므로 수정하지 않는다.
+`calculate_psnr` 의 peak 는 `ref` 의 최댓값이다 (label 이 항상 1.0 은 아니다).
+
+# %% Cell 14 [code]
+IMG_DIM: int = 4
+
+
+class SSIMcal(torch.nn.Module):
+    def __init__(self, win_size: int = 11, k1: float = 0.01, k2: float = 0.03):
+        super().__init__()
+        self.win_size = win_size
+        self.k1, self.k2 = k1, k2
+        self.register_buffer("w", torch.ones(1, 1, win_size, win_size) / win_size**2)
+        np_ = win_size**2
+        self.cov_norm = np_ / (np_ - 1)
+
+    def forward(self, img: Tensor, ref: Tensor, data_range: Tensor) -> Tensor:
+        data_range = data_range[:, None, None, None]
+        C1 = (self.k1 * data_range) ** 2
+        C2 = (self.k2 * data_range) ** 2
+
+        w = self.w.to(img.device)
+        ux = functional.conv2d(img, w)
+        uy = functional.conv2d(ref, w)
+        uxx = functional.conv2d(img * img, w)
+        uyy = functional.conv2d(ref * ref, w)
+        uxy = functional.conv2d(img * ref, w)
+
+        vx = self.cov_norm * (uxx - ux * ux)
+        vy = self.cov_norm * (uyy - uy * uy)
+        vxy = self.cov_norm * (uxy - ux * uy)
+
+        A1 = 2 * ux * uy + C1
+        A2 = 2 * vxy + C2
+        B1 = ux**2 + uy**2 + C1
+        B2 = vx + vy + C2
+
+        return torch.mean((A1 * A2) / (B1 * B2), dim=[2, 3], keepdim=True)
+
+
+ssim_cal = SSIMcal()
+
+
+def calculate_ssim(img: Tensor, ref: Tensor, mask: Tensor | None = None) -> Tensor:
+    if not (img.dim() == IMG_DIM and ref.dim() == IMG_DIM):
+        raise ValueError("All tensors must be 4D.")
+
+    if mask is None:
+        img_mask, ref_mask = img, ref
+    else:
+        if mask.dim() != IMG_DIM:
+            raise ValueError("Mask must be 4D.")
+        img_mask, ref_mask = img * mask, ref * mask
+
+    ones = torch.ones(ref.shape[0], device=ref.device)
+    return ssim_cal.forward(img_mask, ref_mask, ones)
+
+
+def calculate_psnr(img: Tensor, ref: Tensor, mask: Tensor | None = None) -> Tensor:
+    if not (img.dim() == IMG_DIM and ref.dim() == IMG_DIM):
+        raise ValueError("All tensors must be 4D.")
+
+    if mask is not None:
+        if mask.dim() != IMG_DIM:
+            raise ValueError("Mask must be 4D.")
+        img_mask, ref_mask = img * mask, ref * mask
+        mse = torch.sum((img_mask - ref_mask) ** 2, dim=(1, 2, 3)) / torch.sum(mask, dim=(1, 2, 3))
+    else:
+        mse = torch.mean(functional.mse_loss(img, ref, reduction="none"), dim=(1, 2, 3), keepdim=True)
+
+    img_max = torch.amax(ref, dim=(1, 2, 3), keepdim=True)
+    return 10 * torch.log10(img_max**2 / (mse + 1e-12))
+
+
+def finalize(pred: Tensor) -> Tensor:
+    # 모든 방법에 동일하게 적용하는 후처리. label 이 [0,1] 이므로 clip 한다
+    return pred.clamp(0.0, 1.0) if config.clip_output else pred
+
+
+def psnr_ssim_np(img: np.ndarray, ref: np.ndarray) -> tuple[float, float]:
+    def _t(arr: np.ndarray) -> Tensor:
+        return torch.from_numpy(np.ascontiguousarray(arr)).float()[None, None]
+
+    _img, _ref = _t(img), _t(ref)
+    return float(calculate_psnr(_img, _ref).item()), float(calculate_ssim(_img, _ref).mean().item())
+
+
+# 자기검증: 동일 영상은 PSNR 이 매우 커야 하고 SSIM 은 1 이어야 한다
+_a = torch.rand(2, 1, 64, 64)
+print("identical  psnr:", calculate_psnr(_a, _a).flatten().tolist(), " ssim:", calculate_ssim(_a, _a).flatten().tolist())
+_b = (_a + 0.1).clamp(0, 1)
+print("perturbed  psnr:", [round(v, 3) for v in calculate_psnr(_b, _a).flatten().tolist()])
+
+# %% Cell 15 [markdown]
+## 4. Dataset
+
+### 4-1. 데이터 생성 규칙 준수
+
+> For each clean image, you may generate up to 6 dipole kernel orientations.
+> For each orientation, you may generate up to 2 noisy images.
+> **Do not exceed 12 corrupted images per clean image.**
+
+`variant_mode="pool"` (기본) 은 `(파일명, variant_idx)` 로 노이즈를 **결정론적으로 확정**해
+clean 1장당 corrupted 를 **정확히 12장**으로 고정한다. epoch 을 몇 번 돌려도 이 수는 늘지 않는다.
+
+| mode | clean 당 corrupted | 규칙 |
+|---|---|---|
+| `pool` (기본) | **12** (4 noise × 3 σ 실현) | 준수 |
+| `onthefly` | epoch 수만큼 증가 | 조교 example 의 방식. 60 epoch 이면 상한의 5배 |
+
+flip 은 clean 영상 자체의 기하 변환이므로 noise budget 과 무관한 일반 augmentation 이다.
+
+### 4-2. 층화(stratified) validation
+
+`claude/iter3_review.md` 8절에서 무작위 추첨 validation 이 run 간 비교를 불가능하게 만든 것을 확인했다
+(iter2 val 입력 25.88 dB vs iter3 val 29.31 dB — 서로 다른 문제를 풀고 있었다).
+
+여기서는 `이미지 × noise 4종 × σ 3층` 을 **전수 열거**한다.
+
+- 4종이 정확히 균등 → test 의 25/25/25/25 분포와 일치
+- σ 는 범위를 3등분한 중앙값으로 고정 → 추첨 분산 0
+- run 이 달라도 **정확히 같은 문제**를 푼다
+
+# %% Cell 16 [code]
+class DataKey(IntEnum):
+    Label = 0
+    Measure = 1
+    Blur = 2
+    NoisyLabel = 3
+    NoiseId = 4
+    Name = 5
+
+
+def variant_spec(name: str, k: int) -> tuple[str, float, int]:
+    # (파일명, variant index) -> (noise_type, sigma, seed). 결정론적이고 4종이 균등하다
+    h = zlib.crc32(f"{name}|v{k}".encode("utf-8")) & 0x7FFFFFFF
+    nz = NOISE_NAMES[k % len(NOISE_NAMES)]
+    lo, hi = NOISE_RANGES[nz]
+    return nz, random.Random(h).uniform(lo, hi), h
+
+
+def stratified_val_spec(name: str, t: int, level: int, levels: int) -> tuple[str, float, int]:
+    # noise 종류 t, sigma 층 level -> 결정론적 spec. sigma 는 범위의 (level+0.5)/levels 지점
+    nz = NOISE_NAMES[t]
+    lo, hi = NOISE_RANGES[nz]
+    sigma = lo + (hi - lo) * (level + 0.5) / levels
+    seed = zlib.crc32(f"{name}|val|{t}|{level}".encode("utf-8")) & 0x7FFFFFFF
+    return nz, sigma, seed
+
+
+def _flip(x: Tensor, code_: int) -> Tensor:
+    if code_ & 1:
+        x = torch.flip(x, dims=[-1])
+    if code_ & 2:
+        x = torch.flip(x, dims=[-2])
+    return x
+
+
+class TrainDataset(Dataset):
+    def __init__(self, split: PackedSplit, variant_mode: str, variant_pool: int, augment: bool = True) -> None:
+        self.split = split
+        self.variant_mode = variant_mode
+        self.variant_pool = variant_pool
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.split)
+
+    def __getitem__(self, idx: int):
+        name = self.split.names[idx]
+        label = torch.from_numpy(self.split.get(idx)).float()
+
+        if self.augment:
+            label = _flip(label, random.randrange(4))
+
+        if self.variant_mode == "pool":
+            k = random.randrange(self.variant_pool)
+            nz, sigma, seed = variant_spec(name, k)
+        else:
+            nz = random.choice(NOISE_NAMES)
+            lo, hi = NOISE_RANGES[nz]
+            sigma, seed = random.uniform(lo, hi), None
+
+        blur, measure = degrade(label, nz, sigma, seed)
+
+        # clean branch 용: dipole 없이 noise 만 얹은 영상 (독립적인 노이즈)
+        nz2 = random.choice(NOISE_NAMES)
+        lo2, hi2 = NOISE_RANGES[nz2]
+        noisy_label = apply_noise(label, nz2, random.uniform(lo2, hi2), None)
+
+        return (
+            label[None],
+            measure[None],
+            blur[None],
+            noisy_label[None],
+            NOISE_NAMES.index(nz),
+            name,
+        )
+
+
+class StratifiedValDataset(Dataset):
+    def __init__(self, split: PackedSplit, levels: int) -> None:
+        self.split = split
+        self.levels = levels
+        self.combos = [(i, t, l) for i in range(len(split)) for t in range(len(NOISE_NAMES)) for l in range(levels)]
+
+    def __len__(self) -> int:
+        return len(self.combos)
+
+    def __getitem__(self, idx: int):
+        i, t, l = self.combos[idx]
+        name = self.split.names[i]
+        label = torch.from_numpy(self.split.get(i)).float()
+        nz, sigma, seed = stratified_val_spec(name, t, l, self.levels)
+        blur, measure = degrade(label, nz, sigma, seed)
+        return label[None], measure[None], blur[None], label[None], t, name
+
+
+class TestDataset(Dataset):
+    # 제공된 test_deconv_noise(measure) + test_label(정답)
+    def __init__(self) -> None:
+        self.measure = PackedSplit("test_measure")
+        self.label = PackedSplit("test_label")
+        pos = self.label.name_to_pos()
+        missing = [n for n in self.measure.names if n not in pos]
+        if missing:
+            raise KeyError(f"test_label 에 없는 파일: {missing[:3]}")
+        self.label_pos = [pos[n] for n in self.measure.names]
+
+    def __len__(self) -> int:
+        return len(self.measure)
+
+    def __getitem__(self, idx: int):
+        name = self.measure.names[idx]
+        measure = torch.from_numpy(self.measure.get(idx)).float()
+        label = torch.from_numpy(self.label.get(self.label_pos[idx])).float()
+        blur = dipole_forward(label)
+        nz = TEST_NOISE_META.get(name, {}).get("noise_type")
+        nid = NOISE_NAMES.index(nz) if nz in NOISE_NAMES else -1
+        return label[None], measure[None], blur[None], label[None], nid, name
+
+
+def make_loaders() -> tuple[DataLoader, DataLoader, DataLoader]:
+    train_split = PackedSplit(config.train_split, limit=config.max_train_images)
+    val_split = PackedSplit(config.valid_split, l1_only=config.valid_l1_only)
+
+    train_ds = TrainDataset(train_split, config.variant_mode, config.variant_pool)
+    val_ds = StratifiedValDataset(val_split, config.val_sigma_levels)
+    test_ds = TestDataset()
+    return train_ds, val_ds, test_ds
+
+
+train_ds, val_ds, test_ds = make_loaders()
+test_dataset = test_ds  # example 호환 별칭
+print(f"train : {len(train_ds)}장 | variant_mode={config.variant_mode} pool={config.variant_pool}")
+print(f"        → clean 당 corrupted {config.variant_pool if config.variant_mode == 'pool' else '무제한(규칙 위반 위험)'}")
+print(f"val   : 이미지 {len(val_ds.split)}장 × noise {len(NOISE_NAMES)}종 × σ {config.val_sigma_levels}층 = {len(val_ds)} 조합")
+print(f"test  : {len(test_ds)}장")
+
+print()
+print("variant pool 자기검증 (같은 clean 의 12개 variant):")
+_nm = train_ds.split.names[0]
+for _k in range(config.variant_pool):
+    _nz, _sg, _sd = variant_spec(_nm, _k)
+    print(f"  v{_k:<3}{_nz:<18}sigma={_sg:.4f}")
+_a = variant_spec(_nm, 0)
+print(f"  재현성: variant_spec 재호출 동일 → {_a == variant_spec(_nm, 0)}")
+
+# %% Cell 17 [markdown]
+### 4-3. 학습 pair 눈으로 확인
+
+`label x` → `dipole blur Ax` → `measure N(Ax)` 가 실제로 만들어지는지,
+그리고 clean branch 입력 `N(x)` 가 어떻게 보이는지 확인한다.
+
+# %% Cell 18 [code]
+_loader = DataLoader(train_ds, batch_size=6, shuffle=True, num_workers=0)
+_b = next(iter(_loader))
+_l, _m, _bl, _nl, _nid, _n = _b
+print(f"label   : {tuple(_l.shape)} range [{_l.min():.3f}, {_l.max():.3f}]")
+print(f"blur    : {tuple(_bl.shape)} range [{_bl.min():.3f}, {_bl.max():.3f}]")
+print(f"measure : {tuple(_m.shape)} range [{_m.min():.3f}, {_m.max():.3f}]")
+print(f"noise   : {[NOISE_NAMES[i] for i in _nid.tolist()]}")
+
+n = _l.shape[0]
+fig, axes = plt.subplots(4, n, figsize=(2.6 * n, 11))
+for i in range(n):
+    axes[0, i].imshow(_l[i, 0].numpy(), cmap="gray", vmin=0, vmax=1)
+    axes[0, i].set_title(f"label x\n{_n[i][:14]}", fontsize=8)
+    _bb = _bl[i, 0].numpy()
+    axes[1, i].imshow(_bb, cmap="gray", vmin=np.percentile(_bb, 1), vmax=np.percentile(_bb, 99))
+    axes[1, i].set_title("dipole blur Ax", fontsize=8)
+    _mm = _m[i, 0].numpy()
+    axes[2, i].imshow(_mm, cmap="gray", vmin=np.percentile(_mm, 1), vmax=np.percentile(_mm, 99))
+    axes[2, i].set_title(f"measure N(Ax)\n{NOISE_NAMES[_nid[i]]}", fontsize=8)
+    axes[3, i].imshow(_nl[i, 0].numpy(), cmap="gray", vmin=0, vmax=1)
+    axes[3, i].set_title("noisy label N(x)", fontsize=8)
+    for r in range(4):
+        axes[r, i].axis("off")
+fig.suptitle("train synthetic pair  |  아래 두 줄이 denoiser 가 보는 두 종류 입력")
+fig.tight_layout(rect=(0, 0, 1, 0.95))
+plt.show()
+del _loader
+
+# %% Cell 19 [markdown]
+## 5. Conventional methods
+
+학습 없이 forward model 을 안다는 가정만으로 복원한다.
+
+1. **denoise** : mean / median / adaptive filter
+2. **deconvolve** : Wiener filter $\hat{x}=\mathcal{F}^{-1}\{\frac{D}{D^2+K}\mathcal{F}\{y\}\}$
+
+`D` 가 실수이므로 `(1/D)·D²/(D²+K) = D/(D²+K)` 로 0 나눗셈 없이 계산된다.
+즉 **Wiener 와 Tikhonov 는 이 문제에서 동일한 필터**다.
+
+`K` 는 validation 에서 PSNR 이 최대가 되도록 sweep 해서 고른다 (label 을 쓰는 튜닝이므로 test 는 건드리지 않는다).
+
+# %% Cell 20 [code]
+def _as_bchw(img: Tensor) -> tuple[Tensor, int]:
+    dim = img.dim()
+    if dim == 2:
+        return img[None, None], dim
+    if dim == 3:
+        return img[None], dim
+    if dim == 4:
+        return img, dim
+    raise ValueError(f"unsupported image dim: {dim}")
+
+
+def _restore_dim(img: Tensor, dim: int) -> Tensor:
+    if dim == 2:
+        return img[0, 0]
+    if dim == 3:
+        return img[0]
+    return img
+
+
+def mean_filter(img: Tensor, kernel_size: int = 3) -> Tensor:
+    x, dim = _as_bchw(img)
+    pad = kernel_size // 2
+    x = functional.pad(x, (pad, pad, pad, pad), mode="reflect")
+    return _restore_dim(functional.avg_pool2d(x, kernel_size=kernel_size, stride=1), dim)
+
+
+def median_filter(img: Tensor, kernel_size: int = 3) -> Tensor:
+    x, dim = _as_bchw(img)
+    pad = kernel_size // 2
+    x = functional.pad(x, (pad, pad, pad, pad), mode="reflect")
+    patches = x.unfold(2, kernel_size, 1).unfold(3, kernel_size, 1)
+    out = patches.reshape(*patches.shape[:4], -1).median(dim=-1).values
+    return _restore_dim(out, dim)
+
+
+def adaptive_filter(img: Tensor, kernel_size: int = 5, noise_var: Tensor | float | None = None) -> Tensor:
+    x, dim = _as_bchw(img)
+    pad = kernel_size // 2
+    xp = functional.pad(x, (pad, pad, pad, pad), mode="reflect")
+
+    local_mean = functional.avg_pool2d(xp, kernel_size=kernel_size, stride=1)
+    local_sq = functional.avg_pool2d(xp.pow(2), kernel_size=kernel_size, stride=1)
+    local_var = (local_sq - local_mean.pow(2)).clamp_min(0.0)
+
+    if noise_var is None:
+        noise_var = local_var.flatten(2).median(dim=-1).values[:, :, None, None]
+
+    ratio = (noise_var / local_var.clamp_min(1e-8)).clamp(max=1.0)
+    return _restore_dim(x - ratio * (x - local_mean), dim)
+
+
+def wiener_deconv(img: Tensor, K: float) -> Tensor:
+    kernel = dipole_kernel(tuple(img.shape[-2:])).to(img.device)
+    w = kernel / (kernel**2 + K)
+    img_k = torch.fft.fftn(img.float(), dim=(-2, -1))
+    return torch.fft.ifftn(img_k * w, dim=(-2, -1)).real
+
+
+def tkd(img: Tensor, clip: float = 5.0) -> Tensor:
+    kernel = dipole_kernel(tuple(img.shape[-2:])).to(img.device)
+    kernel_inv = torch.clip(1 / kernel, min=-clip, max=clip)
+    img_k = torch.fft.fftn(img.float(), dim=(-2, -1))
+    return torch.fft.ifftn(img_k * kernel_inv, dim=(-2, -1)).real
+
+
+BASELINE_KERNEL: int = 3
+ADAPTIVE_KERNEL: int = 5
+
+PREFILTERS: dict[str, Callable[[Tensor], Tensor]] = {
+    "none": lambda x: x,
+    "mean": lambda x: mean_filter(x, kernel_size=BASELINE_KERNEL),
+    "median": lambda x: median_filter(x, kernel_size=BASELINE_KERNEL),
+    "adaptive": lambda x: adaptive_filter(x, kernel_size=ADAPTIVE_KERNEL),
+}
+PREFILTER_LABEL: dict[str, str] = {
+    "none": "Wiener only",
+    "mean": f"Mean {BASELINE_KERNEL}x{BASELINE_KERNEL} + Wiener",
+    "median": f"Median {BASELINE_KERNEL}x{BASELINE_KERNEL} + Wiener",
+    "adaptive": f"Adaptive {ADAPTIVE_KERNEL}x{ADAPTIVE_KERNEL} + Wiener",
+}
+
+# Wiener == Tikhonov 항등식 검증
+_t = torch.rand(1, 1, 64, 64)
+_k = dipole_kernel((64, 64))
+_w1 = _k / (_k**2 + 1e-3)
+_w2 = (1 / _k) * (_k**2 / (_k**2 + 1e-3))
+print("Wiener == Tikhonov:", torch.allclose(_w1, _w2, atol=1e-5), f"(max diff {float((_w1 - _w2).abs().max()):.2e})")
+
+# %% Cell 21 [code]
+WIENER_K_GRID: list[float] = [float(k) for k in np.logspace(-4, 0.5, 19)]
+
+valid_loader = DataLoader(val_ds, batch_size=config.valid_batch, shuffle=False, num_workers=config.num_workers)
+test_loader = DataLoader(test_ds, batch_size=config.valid_batch, shuffle=False, num_workers=config.num_workers)
+
+
+def sweep_wiener_K(
+    loader: DataLoader,
+    pre: Callable[[Tensor], Tensor],
+    k_grid: list[float],
+    device: torch.device,
+) -> tuple[float, dict[float, float]]:
+    acc: dict[float, list[float]] = {k: [] for k in k_grid}
+    with torch.no_grad():
+        for _data in loader:
+            label = _data[DataKey.Label].to(device, non_blocking=True)
+            measure = _data[DataKey.Measure].to(device, non_blocking=True)
+            filtered = pre(measure)
+            for k in k_grid:
+                pred = finalize(wiener_deconv(filtered, K=k))
+                acc[k].extend(calculate_psnr(pred, label).flatten().tolist())
+    mean_psnr = {k: float(np.mean(v)) for k, v in acc.items()}
+    return max(mean_psnr, key=mean_psnr.get), mean_psnr
+
+
+BEST_K: dict[str, float] = {}
+K_CURVES: dict[str, dict[float, float]] = {}
+
+for _key, _fn in PREFILTERS.items():
+    t0 = time.time()
+    _best, _curve = sweep_wiener_K(valid_loader, _fn, WIENER_K_GRID, config.device)
+    BEST_K[_key] = _best
+    K_CURVES[_key] = _curve
+    print(f"{PREFILTER_LABEL[_key]:<34} best K = {_best:.4g}  (valid PSNR {_curve[_best]:.3f} dB, {time.time() - t0:.1f}s)")
+
+(WORK_ROOT / "best_k.json").write_text(json.dumps(BEST_K, indent=2), encoding="utf-8")
+
+fig, ax = plt.subplots(figsize=(7.5, 4.6))
+for _key in PREFILTERS:
+    _curve = K_CURVES[_key]
+    ax.semilogx(list(_curve.keys()), list(_curve.values()), marker="o", ms=3, label=PREFILTER_LABEL[_key])
+    ax.scatter([BEST_K[_key]], [_curve[BEST_K[_key]]], s=70, zorder=5, facecolors="none", edgecolors="k")
+ax.set_xlabel("Wiener K")
+ax.set_ylabel("valid PSNR [dB]")
+ax.set_title("Wiener K sweep on stratified validation")
+ax.grid(alpha=0.3)
+ax.legend(fontsize=9)
+fig.tight_layout()
+plt.show()
+
+# %% Cell 22 [markdown]
+## 6. Models
+
+| | key | 구조 | 목표 | 근거 |
+|---|---|---|---|---|
+| **A** | `unet_e2e` | U-Net `chans=64` (13.43 M) | measure → label 직접 회귀 | 조교 제공 ckpt 와 동일 구조. 재현/비교 기준 |
+| **B** | `dncnn_blur` | DnCNN 20층 96 feat (1.58 M) | measure → `Ax` (noise 만 제거) | deconvolution 은 Wiener 가 담당. 역할 분리 |
+| **C** | `phys_unet` | U-Net `chans=48`, 입력 3채널 | Wiener base + **residual** | 아래 설명 |
+
+### C 를 넣는 이유
+
+`gemini-deconvolution/iter1` 에서 raw measure 만 주고 U-Net 에 deconvolution 을 맡겼더니
+**25.59 dB** 로, 한 줄짜리 Wiener filter(42.25 dB)보다 16.7 dB 나빴다.
+dipole 은 k-space 대각 연산자이고 그 역은 원점 근처에서 값이 4e4 까지 치솟는 **전역·비국소** 연산이라,
+receptive field 가 유한한 CNN 이 바닥부터 배우기에 가장 불리한 형태다.
+
+iter2 에서 **해석적 역필터 결과를 입력 채널로 주고 residual 만 학습**하도록 바꾸자 78 dB 로 올랐다.
+여기서도 같은 구조를 쓴다.
+
+```
+measure ─┬─────────────────────────────► ch0
+         ├─ Wiener(measure, K)     ────► ch1   (= base, 주 추정치)
+         └─ Wiener(measure, K×10)  ────► ch2   (더 강한 정규화)
+                        │
+                        ▼  3채널
+                     U-Net
+                        │
+   output = base + scale · UNet(...)      ← 마지막 conv zero-init
+```
+
+마지막 conv 를 **zero-init** 하므로 학습 시작 시점의 출력이 `base` 와 정확히 같다.
+즉 **conventional 성능에서 출발**하며, 학습이 실패해도 Wiener 이하로 내려가지 않는다.
+
+# %% Cell 23 [code]
+class ConvBlock(nn.Module):
+    def __init__(self, in_chans: int, out_chans: int) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_chans, out_chans, kernel_size=3, padding=1),
+            nn.GroupNorm(4, out_chans),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(out_chans, out_chans, kernel_size=3, padding=1),
+            nn.GroupNorm(4, out_chans),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.layers(x)
+
+
+def create_down_sample_layers(in_chans: int, chans: int, num_pool_layers: int) -> nn.ModuleList:
+    layers = nn.ModuleList([ConvBlock(in_chans, chans)])
+    ch = chans
+    for _ in range(num_pool_layers - 1):
+        layers.append(ConvBlock(ch, ch * 2))
+        ch *= 2
+    return layers
+
+
+def create_up_sample_layers(chans: int, num_pool_layers: int) -> nn.ModuleList:
+    layers = nn.ModuleList()
+    ch = chans * (2 ** (num_pool_layers - 1))
+    for _ in range(num_pool_layers - 1):
+        layers.append(ConvBlock(ch * 2, ch // 2))
+        ch //= 2
+    layers.append(ConvBlock(ch * 2, ch))
+    return layers
+
+
+class Unet(nn.Module):
+    def __init__(self, in_chans: int = 1, out_chans: int = 1, chans: int = 32, num_pool_layers: int = 4) -> None:
+        super().__init__()
+        self.in_chans = in_chans
+        self.out_chans = out_chans
+        self.num_pool_layers = num_pool_layers
+
+        self.down_sample_layers = create_down_sample_layers(in_chans, chans, num_pool_layers)
+        self.bottleneck_conv = ConvBlock(chans * (2 ** (num_pool_layers - 1)), chans * (2 ** (num_pool_layers - 1)))
+        self.up_sample_layers = create_up_sample_layers(chans, num_pool_layers)
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(chans, chans, kernel_size=3, padding=1),
+            nn.GroupNorm(4, chans),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(chans, out_chans, kernel_size=1, padding=0),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        stack = []
+        output = x
+        for layer in self.down_sample_layers:
+            output = layer(output)
+            stack.append(output)
+            output = functional.max_pool2d(output, kernel_size=2)
+
+        output = self.bottleneck_conv(output)
+
+        for layer in self.up_sample_layers:
+            downsampled_output = stack.pop()
+            output = functional.interpolate(
+                output, size=downsampled_output.shape[-2:], mode="bilinear", align_corners=False
+            )
+            output = torch.cat([output, downsampled_output], dim=1)
+            output = layer(output)
+
+        return self.final_conv(output)
+
+
+class DnCNN(nn.Module):
+    def __init__(self, channels: int, num_of_layers: int, kernel_size: int, padding: int, features: int) -> None:
+        super().__init__()
+        layers: list[nn.Module] = [
+            nn.Conv2d(channels, features, kernel_size=kernel_size, padding=padding, bias=False),
+            nn.SiLU(inplace=True),
+        ]
+        for _ in range(num_of_layers - 1):
+            layers += [
+                nn.Conv2d(features, features, kernel_size=kernel_size, padding=padding, bias=False),
+                nn.GroupNorm(4, features),
+                nn.SiLU(inplace=True),
+            ]
+        layers.append(nn.Conv2d(features, channels, kernel_size=kernel_size, padding=padding, bias=False))
+        self.dncnn = nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"Input tensor must be 4D, but got {x.dim()}D tensor.")
+        return x + self.dncnn(x)
+
+
+class PhysResUnet(nn.Module):
+    # Wiener 해석해를 base 로 두고 U-Net 은 국소 잔차만 학습한다
+    def __init__(self, chans: int = 48, num_pool_layers: int = 4, wiener_K: float = 0.01, scale: float = 0.1) -> None:
+        super().__init__()
+        self.wiener_K = wiener_K
+        self.scale = scale
+        self.net = Unet(in_chans=3, out_chans=1, chans=chans, num_pool_layers=num_pool_layers)
+        # 마지막 conv zero-init -> 초기 출력 == base
+        last = self.net.final_conv[-1]
+        nn.init.zeros_(last.weight)
+        if last.bias is not None:
+            nn.init.zeros_(last.bias)
+
+    def features(self, measure: Tensor) -> tuple[Tensor, Tensor]:
+        with torch.autocast(device_type=measure.device.type, enabled=False):
+            m = measure.float()
+            base = wiener_deconv(m, K=self.wiener_K)
+            soft = wiener_deconv(m, K=self.wiener_K * 10.0)
+            x = torch.cat([m, base, soft], dim=1)
+        return x, base
+
+    def forward(self, measure: Tensor) -> Tensor:
+        x, base = self.features(measure)
+        return base + self.scale * self.net(x)
+
+
+MODEL_CONFIG_DEFAULT = {
+    "in_chans": 1,
+    "out_chans": 1,
+    "chans": 64,
+    "num_pool_layers": 4,
+    "dncnn_layers": 20,
+    "dncnn_features": 96,
+    "dncnn_kernel": 3,
+    "phys_chans": 48,
+    "phys_scale": 0.1,
+}
+
+
+def build_model(spec: dict) -> nn.Module:
+    mc = {**MODEL_CONFIG_DEFAULT, **spec.get("model_config", {})}
+    arch = spec["arch"]
+    if arch == "unet":
+        model = Unet(mc["in_chans"], mc["out_chans"], mc["chans"], mc["num_pool_layers"])
+    elif arch == "dncnn":
+        model = DnCNN(1, mc["dncnn_layers"], mc["dncnn_kernel"], mc["dncnn_kernel"] // 2, mc["dncnn_features"])
+    elif arch == "phys_unet":
+        model = PhysResUnet(mc["phys_chans"], mc["num_pool_layers"], spec.get("wiener_K", 0.01), mc["phys_scale"])
+    else:
+        raise ValueError(f"unknown arch: {arch}")
+    return model
+
+
+for _k, _s in [("unet(64)", {"arch": "unet"}), ("dncnn(20,96)", {"arch": "dncnn"}), ("phys_unet(48)", {"arch": "phys_unet"})]:
+    _m = build_model(_s)
+    print(f"{_k:<16}{sum(p.numel() for p in _m.parameters()):>12,} params")
+del _m
+
+# %% Cell 24 [markdown]
+## 7. 학습
+
+### 설계 결정
+
+| 항목 | 값 | 근거 |
+|---|---|---|
+| LR schedule | **cosine** (warmup 1 epoch) | `claude/iter1_review.md` 2.2 — `0.88^ep` 지수감쇠는 성능이 오르는 중에 LR 을 죽인다. iter2 에서 cosine 으로 바꾸자 +3.83 dB |
+| loss | **L1** (+ 옵션 SSIM, data-consistency) | `claude/iter3_review.md` 4 — S&P/Rician 은 zero-mean 이 아니라 L1(조건부 median)이 강건. SSIM 도 채점 대상 |
+| AMP | fp16 autocast | FFT 연산은 fp32 로 강제 (`autocast(enabled=False)`) |
+| best 선택 | stratified val PSNR | 4절 |
+| early stop | patience 10 | 조교 spec 과 동일 |
+
+### `clean_branch_prob`
+
+조교 ckpt 의 `spec` 에 `clean_branch_prob=0.5` 가 있다.
+확률 `p` 로 입력을 `N(x)` (dipole 없이 noise 만), 목표를 `x` 로 바꿔 **denoising 만** 학습시키는 augmentation 이다.
+
+단 `phys_unet` 은 입력에 Wiener 역필터를 거는 구조라 blur 가 없는 `N(x)` 를 넣으면 물리가 어긋난다.
+따라서 C 는 `clean_branch_prob=0.0` 으로 둔다.
+
+# %% Cell 25 [code]
+def get_lr(epoch: int, spec: dict) -> float:
+    # 1-indexed epoch. warmup 후 cosine
+    lr, total = spec["lr"], spec["epochs"]
+    warm = spec.get("warmup", 1)
+    if spec.get("lr_schedule", "cosine") == "exp":
+        return lr * spec.get("lr_decay", 0.95) ** max(0, epoch - spec.get("lr_tol", 1))
+    if epoch <= warm:
+        return lr * epoch / max(1, warm)
+    t = (epoch - warm) / max(1, total - warm)
+    return lr * (spec.get("lr_min_ratio", 0.02) + (1 - spec.get("lr_min_ratio", 0.02)) * 0.5 * (1 + math.cos(math.pi * t)))
+
+
+def compute_loss(pred: Tensor, target: Tensor, measure: Tensor, spec: dict) -> Tensor:
+    base = spec.get("loss_model", "l1")
+    loss = functional.l1_loss(pred, target) if base == "l1" else functional.mse_loss(pred, target)
+    w_ssim = spec.get("ssim_weight", 0.0)
+    if w_ssim > 0:
+        loss = loss + w_ssim * (1.0 - calculate_ssim(pred.clamp(0, 1), target.clamp(0, 1)).mean())
+    w_dc = spec.get("dc_weight", 0.0)
+    if w_dc > 0 and spec["target"] == "label":
+        with torch.autocast(device_type=pred.device.type, enabled=False):
+            loss = loss + w_dc * functional.l1_loss(dipole_forward(pred.float()), measure.float())
+    return loss
+
+
+def model_forward(model: nn.Module, measure: Tensor, spec: dict) -> Tensor:
+    return model(measure)
+
+
+@torch.no_grad()
+def evaluate_loader(model: nn.Module, loader: DataLoader, spec: dict, deconv_K: float | None = None) -> dict:
+    # target="blur" 인 모델은 Wiener 를 붙여 label 기준으로 평가한다
+    model.eval()
+    per_type: dict[int, list[tuple[float, float]]] = {i: [] for i in range(len(NOISE_NAMES))}
+    psnr_all, ssim_all = [], []
+    for data in loader:
+        label = data[DataKey.Label].to(config.device, non_blocking=True)
+        measure = data[DataKey.Measure].to(config.device, non_blocking=True)
+        nid = data[DataKey.NoiseId]
+        pred = model_forward(model, measure, spec)
+        if spec["target"] == "blur":
+            pred = wiener_deconv(pred, K=deconv_K if deconv_K is not None else BEST_K["none"])
+        pred = finalize(pred)
+        p = calculate_psnr(pred, label).flatten().tolist()
+        s = calculate_ssim(pred, label).flatten().tolist()
+        psnr_all += p
+        ssim_all += s
+        for j, t in enumerate(nid.tolist()):
+            if t >= 0:
+                per_type[t].append((p[j], s[j]))
+    out = {
+        "psnr": float(np.mean(psnr_all)),
+        "ssim": float(np.mean(ssim_all)),
+        "psnr_std": float(np.std(psnr_all, ddof=1)) if len(psnr_all) > 1 else 0.0,
+    }
+    for t, v in per_type.items():
+        if v:
+            out[f"psnr_{NOISE_NAMES[t]}"] = float(np.mean([x[0] for x in v]))
+            out[f"ssim_{NOISE_NAMES[t]}"] = float(np.mean([x[1] for x in v]))
+    return out
+
+
+def next_run_id(root: Path) -> int:
+    root.mkdir(parents=True, exist_ok=True)
+    ids = []
+    for e in root.iterdir():
+        if e.is_dir():
+            try:
+                ids.append(int(e.name.split("_")[0]))
+            except ValueError:
+                pass
+    return max(ids) + 1 if ids else 0
+
+# %% Cell 26 [code]
+def train_model(spec: dict) -> dict:
+    key = spec["key"]
+    run_root = WORK_ROOT / "logs_final"
+    run_dir = run_root / f"{next_run_id(run_root):05d}_{key}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    torch.manual_seed(config.seed)
+    random.seed(config.seed)
+
+    model = build_model(spec).to(config.device)
+    n_param = sum(p.numel() for p in model.parameters())
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=spec["batch"],
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
+        persistent_workers=config.num_workers > 0,
+    )
+
+    opt = AdamW(model.parameters(), lr=spec["lr"], weight_decay=spec.get("weight_decay", 1e-4))
+    use_amp = config.amp and torch.cuda.is_available()
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    clean_p = spec.get("clean_branch_prob", 0.0)
+    history: list[dict] = []
+    best = {"psnr": -1e9, "epoch": -1}
+    bad = 0
+    t_start = time.time()
+
+    print(f"=== {spec['name']} ({key}) ===")
+    print(f"  params {n_param:,} | batch {spec['batch']} | epochs {spec['epochs']} | target {spec['target']}")
+    print(f"  loss {spec.get('loss_model', 'l1')} | clean_branch_prob {clean_p} | run_dir {run_dir.name}")
+
+    for epoch in range(1, spec["epochs"] + 1):
+        lr = get_lr(epoch, spec)
+        for g in opt.param_groups:
+            g["lr"] = lr
+
+        model.train()
+        tot, nb = 0.0, 0
+        bar = tqdm(train_loader, desc=f"ep {epoch}/{spec['epochs']}", leave=False, unit="batch")
+        for data in bar:
+            label = data[DataKey.Label].to(config.device, non_blocking=True)
+            measure = data[DataKey.Measure].to(config.device, non_blocking=True)
+            blur = data[DataKey.Blur].to(config.device, non_blocking=True)
+            noisy_label = data[DataKey.NoisyLabel].to(config.device, non_blocking=True)
+
+            if clean_p > 0 and random.random() < clean_p:
+                inp, tgt = noisy_label, label  # denoising 만 학습
+            else:
+                inp = measure
+                tgt = label if spec["target"] == "label" else blur
+
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", enabled=use_amp):
+                pred = model_forward(model, inp, spec)
+                loss = compute_loss(pred, tgt, inp, spec)
+            scaler.scale(loss).backward()
+            if spec.get("grad_clip", 0) > 0:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), spec["grad_clip"])
+            scaler.step(opt)
+            scaler.update()
+
+            tot += float(loss.item())
+            nb += 1
+            bar.set_postfix(loss=f"{tot / nb:.4e}", lr=f"{lr:.2e}")
+
+        rec = {"epoch": epoch, "lr": lr, "train_loss": tot / max(1, nb)}
+
+        if epoch % spec.get("valid_interval", 1) == 0:
+            val = evaluate_loader(model, valid_loader, spec)
+            rec.update({f"val_{k}": v for k, v in val.items()})
+            msg = " ".join(f"{NOISE_NAMES[i][:4]} {val.get(f'psnr_{NOISE_NAMES[i]}', float('nan')):.2f}" for i in range(4))
+            print(
+                f"  ep {epoch:>3} loss {rec['train_loss']:.4e} lr {lr:.2e} | "
+                f"val PSNR {val['psnr']:.3f} SSIM {val['ssim']:.4f} | {msg}"
+            )
+            if val["psnr"] > best["psnr"]:
+                best = {"psnr": val["psnr"], "ssim": val["ssim"], "epoch": epoch}
+                bad = 0
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "model_config": {**MODEL_CONFIG_DEFAULT, **spec.get("model_config", {})},
+                        "spec": spec,
+                        "best": best,
+                    },
+                    run_dir / "checkpoint_best.ckpt",
+                )
+            else:
+                bad += 1
+                if bad >= spec.get("early_stop_patience", 10):
+                    print(f"  early stop at epoch {epoch} (best ep {best['epoch']})")
+                    history.append(rec)
+                    break
+
+        history.append(rec)
+        (run_dir / "history.json").write_text(json.dumps(history, indent=1), encoding="utf-8")
+
+    elapsed = time.time() - t_start
+    (run_dir / "history.json").write_text(json.dumps(history, indent=1), encoding="utf-8")
+    print(f"  done: best val PSNR {best['psnr']:.3f} @ ep {best['epoch']} | {elapsed / 60:.1f} min")
+
+    ckpt = torch.load(run_dir / "checkpoint_best.ckpt", map_location=config.device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    return {"key": key, "spec": spec, "model": model, "run_dir": run_dir, "best": best, "history": history, "params": n_param}
+
+# %% Cell 27 [code]
+SPECS: dict[str, dict] = {
+    "unet_e2e": {
+        "key": "unet_e2e",
+        "name": "A. End2End U-Net",
+        "arch": "unet",
+        "target": "label",
+        "model_config": {"in_chans": 1, "chans": 64},
+        "clean_branch_prob": 0.5,
+        "epochs": 60,
+        "batch": 16,
+        "lr": 2e-4,
+        "loss_model": "l1",
+        "ssim_weight": 0.1,
+        "lr_schedule": "cosine",
+        "early_stop_patience": 10,
+        "grad_clip": 1.0,
+    },
+    "dncnn_blur": {
+        "key": "dncnn_blur",
+        "name": "B. DnCNN denoiser + Wiener",
+        "arch": "dncnn",
+        "target": "blur",
+        "model_config": {"dncnn_layers": 20, "dncnn_features": 96},
+        "clean_branch_prob": 0.0,
+        "epochs": 60,
+        "batch": 16,
+        "lr": 2e-4,
+        "loss_model": "l1",
+        "lr_schedule": "cosine",
+        "early_stop_patience": 10,
+        "grad_clip": 1.0,
+    },
+    "phys_unet": {
+        "key": "phys_unet",
+        "name": "C. Physics-residual U-Net (Wiener base)",
+        "arch": "phys_unet",
+        "target": "label",
+        "model_config": {"phys_chans": 48, "phys_scale": 0.1},
+        "wiener_K": 0.01,
+        "clean_branch_prob": 0.0,
+        "epochs": 60,
+        "batch": 16,
+        "lr": 2e-4,
+        "loss_model": "l1",
+        "ssim_weight": 0.1,
+        "dc_weight": 0.05,
+        "lr_schedule": "cosine",
+        "early_stop_patience": 10,
+        "grad_clip": 1.0,
+    },
+}
+
+# phys_unet 의 Wiener K 는 3-1 sweep 결과로 맞춘다
+SPECS["phys_unet"]["wiener_K"] = BEST_K["none"]
+print("phys_unet wiener_K <-", SPECS["phys_unet"]["wiener_K"])
+
+RESULTS: dict[str, dict] = {}
+
+# --- 스모크 테스트: 먼저 이걸로 1 epoch 돌려 파이프라인을 확인할 것을 권한다 ---
+# config.max_train_images = 200
+# train_ds, val_ds, test_ds = make_loaders()
+# _smoke = {**SPECS["phys_unet"], "epochs": 1}
+# RESULTS["smoke"] = train_model(_smoke)
+
+# %% Cell 28 [markdown]
+### 7-1. 학습 실행
+
+셀을 하나씩 실행한다. GPU 종류에 따라 시간이 크게 달라지므로 `epochs` / `batch` 를 조정할 것.
+`config.max_train_images = 200` 으로 두고 `epochs=1` 스모크 테스트를 먼저 통과시키는 것을 권한다.
+
+# %% Cell 29 [code]
+RESULTS["phys_unet"] = train_model(SPECS["phys_unet"])
+
+# %% Cell 30 [code]
+RESULTS["unet_e2e"] = train_model(SPECS["unet_e2e"])
+
+# %% Cell 31 [code]
+RESULTS["dncnn_blur"] = train_model(SPECS["dncnn_blur"])
+
+# B 는 denoised 출력에 Wiener 를 붙이므로 K 를 다시 sweep 한다
+_m = RESULTS["dncnn_blur"]["model"]
+_m.eval()
+
+
+class _DenoisedWrap:
+    def __call__(self, x: Tensor) -> Tensor:
+        with torch.no_grad():
+            return _m(x)
+
+
+_best_k, _curve = sweep_wiener_K(valid_loader, _DenoisedWrap(), WIENER_K_GRID, config.device)
+RESULTS["dncnn_blur"]["deconv_K"] = _best_k
+print(f"dncnn_blur 출력에 최적인 Wiener K = {_best_k:.4g} (valid PSNR {_curve[_best_k]:.3f} dB)")
+
+# %% Cell 32 [markdown]
+## 8. Test 평가
+
+`test_deconv_noise` 100장을 입력, `test_label` 100장을 정답으로 metric 을 측정한다.
+`noise_meta.json` 은 **결과 분석에만** 쓴다 (모델 입력·선택에 쓰지 않는다).
+
+포함 대상:
+- conventional 4종 (mean/median/adaptive + Wiener, `K` 는 val sweep)
+- 조교 제공 baseline ckpt (`checkpoint_baseline_best.ckpt`)
+- 학습한 A / B / C
+- C + flip TTA
+
+### flip TTA 가 유효한 이유
+
+`D(k)` 는 `X²`, `Y²` 에만 의존하므로 x/y 축 flip 에 대해 짝함수다.
+따라서 `A(flip x) = flip(A x)` 가 정확히 성립하고, flip 4종 평균은 유효한 TTA 다.
+`rot90` 은 `X`↔`Y` 를 바꿔 kernel 자체가 달라지므로 **쓸 수 없다**.
+
+# %% Cell 33 [code]
+# forward model 의 flip 등변성 실측 확인
+_x = torch.rand(1, 1, 256, 256)
+for _name, _dims in [("lr", [-1]), ("ud", [-2]), ("both", [-2, -1])]:
+    _a = dipole_forward(torch.flip(_x, dims=_dims))
+    _b = torch.flip(dipole_forward(_x), dims=_dims)
+    print(f"flip {_name:<5} max|A(Tx) - T(Ax)| = {float((_a - _b).abs().max()):.2e}")
+_a = dipole_forward(torch.rot90(_x, 1, dims=(-2, -1)))
+_b = torch.rot90(dipole_forward(_x), 1, dims=(-2, -1))
+print(f"rot90       max|A(Tx) - T(Ax)| = {float((_a - _b).abs().max()):.2e}  <- 크므로 TTA 불가")
+
+# %% Cell 34 [code]
+BASELINE_CKPT = ROOT / "code_denoising+deconv" / "checkpoint_baseline_best.ckpt"
+baseline_model = None
+if BASELINE_CKPT.exists():
+    _ck = torch.load(BASELINE_CKPT, map_location=config.device, weights_only=False)
+    _mc = _ck["model_config"]
+    baseline_model = Unet(_mc["in_chans"], _mc["out_chans"], _mc["chans"], _mc["num_pool_layers"]).to(config.device)
+    baseline_model.load_state_dict(_ck["model_state_dict"])
+    baseline_model.eval()
+    print(f"baseline ckpt 로드: {sum(p.numel() for p in baseline_model.parameters()):,} params")
+    print(f"  spec: {json.dumps(_ck['spec'], ensure_ascii=False)}")
+else:
+    print(f"baseline ckpt 없음: {BASELINE_CKPT}")
+
+# %% Cell 35 [code]
+@torch.no_grad()
+def predict_model(model: nn.Module, spec: dict, measure: Tensor, deconv_K: float | None = None, tta: bool = False) -> Tensor:
+    model.eval()
+
+    def _once(x: Tensor) -> Tensor:
+        out = model_forward(model, x, spec)
+        if spec["target"] == "blur":
+            out = wiener_deconv(out, K=deconv_K if deconv_K is not None else BEST_K["none"])
+        return out
+
+    if not tta:
+        return finalize(_once(measure))
+
+    acc = torch.zeros_like(measure, dtype=torch.float32)
+    for dims in ([], [-1], [-2], [-2, -1]):
+        xin = torch.flip(measure, dims=dims) if dims else measure
+        out = _once(xin)
+        acc += torch.flip(out, dims=dims).float() if dims else out.float()
+    return finalize(acc / 4.0)
+
+
+def conventional_predict(measure: Tensor) -> dict[str, Tensor]:
+    out = {"measure": finalize(measure)}
+    for key, fn in PREFILTERS.items():
+        out[f"conv_{key}"] = finalize(wiener_deconv(fn(measure), K=BEST_K[key]))
+    return out
+
+
+METHODS: list[str] = ["measure", *[f"conv_{k}" for k in PREFILTERS]]
+METHOD_LABEL: dict[str, str] = {"measure": "Measure (input)", **{f"conv_{k}": v for k, v in PREFILTER_LABEL.items()}}
+
+if baseline_model is not None:
+    METHODS.append("baseline_unet")
+    METHOD_LABEL["baseline_unet"] = "제공 baseline U-Net"
+for _k in ("unet_e2e", "dncnn_blur", "phys_unet"):
+    if _k in RESULTS:
+        METHODS.append(_k)
+        METHOD_LABEL[_k] = RESULTS[_k]["spec"]["name"]
+if "phys_unet" in RESULTS:
+    METHODS.append("phys_unet_tta")
+    METHOD_LABEL["phys_unet_tta"] = "C + flip TTA"
+
+
+def all_predict(measure: Tensor) -> dict[str, Tensor]:
+    out = conventional_predict(measure)
+    if baseline_model is not None:
+        out["baseline_unet"] = predict_model(baseline_model, {"target": "label"}, measure)
+    for k in ("unet_e2e", "dncnn_blur", "phys_unet"):
+        if k in RESULTS:
+            r = RESULTS[k]
+            out[k] = predict_model(r["model"], r["spec"], measure, r.get("deconv_K"))
+    if "phys_unet" in RESULTS:
+        r = RESULTS["phys_unet"]
+        out["phys_unet_tta"] = predict_model(r["model"], r["spec"], measure, tta=True)
+    return out
+
+
+rows: list[dict] = []
+with torch.no_grad():
+    for _data in tqdm(test_loader, desc="test eval", unit="batch"):
+        label = _data[DataKey.Label].to(config.device)
+        measure = _data[DataKey.Measure].to(config.device)
+        names = _data[DataKey.Name]
+        preds = all_predict(measure)
+        for i in range(label.shape[0]):
+            lab_i = label[i : i + 1]
+            row = {"file": names[i], "noise_type": TEST_NOISE_META.get(names[i], {}).get("noise_type", "unknown")}
+            for key in METHODS:
+                p = preds[key][i : i + 1]
+                row[f"psnr_{key}"] = calculate_psnr(p, lab_i).item()
+                row[f"ssim_{key}"] = calculate_ssim(p, lab_i).item()
+            rows.append(row)
+print(f"평가 완료: {len(rows)}장")
+
+# %% Cell 36 [code]
+def print_metric_table(rows: list[dict], methods: list[str], labels: dict[str, str], width: int = 38) -> None:
+    print(f"{'method':<{width}}{'n':>5}{'PSNR':>10}{'+-':>9}{'SSIM':>10}{'+-':>9}")
+    print("-" * (width + 43))
+    for key in methods:
+        psnr = [r[f"psnr_{key}"] for r in rows]
+        ssim = [r[f"ssim_{key}"] for r in rows]
+        print(
+            f"{labels[key]:<{width}}{len(rows):>5}"
+            f"{np.mean(psnr):>10.3f}{np.std(psnr, ddof=1):>9.3f}"
+            f"{np.mean(ssim):>10.4f}{np.std(ssim, ddof=1):>9.4f}"
+        )
+
+
+print("=== 전체 (test 100장) ===")
+print_metric_table(rows, METHODS, METHOD_LABEL)
+
+print()
+print("=== noise type 별 PSNR ===")
+_w = 38
+print(f"{'method':<{_w}}" + "".join(f"{n[:9]:>11}" for n in NOISE_NAMES) + f"{'ALL':>11}")
+print("-" * (_w + 11 * 5))
+for _key in METHODS:
+    _line = f"{METHOD_LABEL[_key]:<{_w}}"
+    for _nt in NOISE_NAMES:
+        _v = [r[f"psnr_{_key}"] for r in rows if r["noise_type"] == _nt]
+        _line += f"{np.mean(_v):>11.3f}" if _v else f"{'-':>11}"
+    _line += f"{np.mean([r[f'psnr_{_key}'] for r in rows]):>11.3f}"
+    print(_line)
+
+print()
+print("=== noise type 별 SSIM ===")
+print(f"{'method':<{_w}}" + "".join(f"{n[:9]:>11}" for n in NOISE_NAMES) + f"{'ALL':>11}")
+print("-" * (_w + 11 * 5))
+for _key in METHODS:
+    _line = f"{METHOD_LABEL[_key]:<{_w}}"
+    for _nt in NOISE_NAMES:
+        _v = [r[f"ssim_{_key}"] for r in rows if r["noise_type"] == _nt]
+        _line += f"{np.mean(_v):>11.4f}" if _v else f"{'-':>11}"
+    _line += f"{np.mean([r[f'ssim_{_key}'] for r in rows]):>11.4f}"
+    print(_line)
+
+# 통계적 유의성 판단용 표준오차
+_sd = float(np.std([r[f"psnr_{METHODS[-1]}"] for r in rows], ddof=1))
+print()
+print(f"이미지별 PSNR 표준편차 {_sd:.3f} dB → noise type 당(n=25) 표준오차 약 {_sd / math.sqrt(25):.3f} dB")
+print("이 값보다 작은 방법 간 격차는 통계적 잡음으로 봐야 한다.")
+
+(WORK_ROOT / "test_metrics.json").write_text(json.dumps(rows, indent=1, ensure_ascii=False), encoding="utf-8")
+print(f"저장: {WORK_ROOT / 'test_metrics.json'}")
+
+# %% Cell 37 [markdown]
+### 8-1. 복원 결과 시각화 + difference map
+
+# %% Cell 38 [code]
+SAMPLE_IDX: int = 0
+
+_label, _measure, _blur, _, _nid, _name = test_ds[SAMPLE_IDX]
+_lab_t = _label[None].to(config.device)
+_mea_t = _measure[None].to(config.device)
+with torch.no_grad():
+    _preds = all_predict(_mea_t)
+
+lab = _lab_t.cpu().numpy().squeeze()
+n_col = 1 + len(METHODS)
+fig, axes = plt.subplots(2, n_col, figsize=(3.0 * n_col, 7.0))
+axes[0, 0].imshow(lab, cmap="gray", vmin=0, vmax=1)
+axes[0, 0].set_title("Label", fontsize=10)
+axes[0, 0].axis("off")
+axes[1, 0].axis("off")
+
+for c, key in enumerate(METHODS):
+    img = _preds[key].cpu().numpy().squeeze()
+    p = calculate_psnr(_preds[key], _lab_t).item()
+    s = calculate_ssim(_preds[key], _lab_t).item()
+    err = np.abs(img - lab)
+    axes[0, c + 1].imshow(img, cmap="gray", vmin=0, vmax=1)
+    axes[0, c + 1].set_title(f"{METHOD_LABEL[key]}\n{p:.2f} dB / {s:.4f}", fontsize=8)
+    axes[0, c + 1].axis("off")
+    im = axes[1, c + 1].imshow(err, cmap="magma", vmin=0, vmax=0.3)
+    axes[1, c + 1].set_title(f"|error| max {err.max():.3f}", fontsize=8)
+    axes[1, c + 1].axis("off")
+fig.colorbar(im, ax=axes[1, -1], fraction=0.046, pad=0.02)
+_nt = TEST_NOISE_META.get(_name, {})
+fig.suptitle(f"Restoration | {_name} | noise={_nt.get('noise_type', '?')} sigma={_nt.get('sigma', float('nan')):.4f}", fontsize=12)
+fig.tight_layout(rect=(0, 0, 1, 0.93))
+plt.show()
+
+# %% Cell 39 [markdown]
+### 8-2. Zoom-in (detail 확인)
+
+# %% Cell 40 [code]
+ZOOM = (96, 96, 64, 64)  # (row, col, h, w)
+_show = [k for k in ["measure", "conv_median", "baseline_unet", "phys_unet_tta", "phys_unet"] if k in _preds][:4]
+
+r0, c0, hh, ww = ZOOM
+fig, axes = plt.subplots(2, 1 + len(_show), figsize=(3.0 * (1 + len(_show)), 6.4))
+axes[0, 0].imshow(lab, cmap="gray", vmin=0, vmax=1)
+axes[0, 0].add_patch(plt.Rectangle((c0, r0), ww, hh, ec="lime", fc="none", lw=1.6))
+axes[0, 0].set_title("Label (전체)", fontsize=9)
+axes[1, 0].imshow(lab[r0 : r0 + hh, c0 : c0 + ww], cmap="gray", vmin=0, vmax=1)
+axes[1, 0].set_title("Label (zoom)", fontsize=9)
+for c, key in enumerate(_show):
+    img = _preds[key].cpu().numpy().squeeze()
+    axes[0, c + 1].imshow(img, cmap="gray", vmin=0, vmax=1)
+    axes[0, c + 1].add_patch(plt.Rectangle((c0, r0), ww, hh, ec="lime", fc="none", lw=1.6))
+    axes[0, c + 1].set_title(METHOD_LABEL[key], fontsize=8)
+    axes[1, c + 1].imshow(img[r0 : r0 + hh, c0 : c0 + ww], cmap="gray", vmin=0, vmax=1)
+    axes[1, c + 1].set_title(f"{calculate_psnr(_preds[key], _lab_t).item():.2f} dB", fontsize=8)
+for ax in axes.flatten():
+    ax.axis("off")
+fig.suptitle(f"Zoom-in {ZOOM} | {_name}", fontsize=12)
+fig.tight_layout(rect=(0, 0, 1, 0.93))
+plt.show()
+
+# %% Cell 41 [markdown]
+### 8-3. Error map (상대 오차율 %)
+
+교수님 요구사항: `error_map = (I_restored − I_GT) / I_GT × 100` (%)
+
+noise type 4종에서 각각 샘플을 골라 생성한다. 어두운 영역(`I_GT→0`)은 상대오차가 발산하므로
+`I_GT < 0.05` 인 픽셀은 마스킹해 표시한다.
+
+# %% Cell 42 [code]
+BEST_METHOD = max(METHODS, key=lambda k: float(np.mean([r[f"psnr_{k}"] for r in rows])))
+print(f"best method: {METHOD_LABEL[BEST_METHOD]} ({BEST_METHOD})")
+
+ERR_DIR = WORK_ROOT / "error_maps"
+ERR_DIR.mkdir(parents=True, exist_ok=True)
+
+# noise type 별로 대표 샘플 1개씩
+_pick: dict[str, int] = {}
+for _i in range(len(test_ds)):
+    _nm = test_ds.measure.names[_i]
+    _t = TEST_NOISE_META.get(_nm, {}).get("noise_type")
+    if _t in NOISE_NAMES and _t not in _pick:
+        _pick[_t] = _i
+    if len(_pick) == len(NOISE_NAMES):
+        break
+
+fig, axes = plt.subplots(3, len(_pick), figsize=(4.0 * len(_pick), 11.5))
+if len(_pick) == 1:
+    axes = axes[:, None]
+for c, (_t, _i) in enumerate(sorted(_pick.items())):
+    _lb, _me, _, _, _, _nm = test_ds[_i]
+    _lb_t, _me_t = _lb[None].to(config.device), _me[None].to(config.device)
+    with torch.no_grad():
+        _pr = all_predict(_me_t)[BEST_METHOD]
+    gt = _lb_t.cpu().numpy().squeeze()
+    pr = _pr.cpu().numpy().squeeze()
+
+    rel = (pr - gt) / (gt + 1e-6) * 100.0
+    rel = np.ma.masked_where(gt < 0.05, rel)
+
+    axes[0, c].imshow(gt, cmap="gray", vmin=0, vmax=1)
+    axes[0, c].set_title(f"GT | {_t}\nsigma={TEST_NOISE_META.get(_nm, {}).get('sigma', float('nan')):.4f}", fontsize=9)
+    axes[1, c].imshow(pr, cmap="gray", vmin=0, vmax=1)
+    axes[1, c].set_title(f"restored  {calculate_psnr(_pr, _lb_t).item():.2f} dB / {calculate_ssim(_pr, _lb_t).item():.4f}", fontsize=9)
+    im = axes[2, c].imshow(rel, cmap="magma", vmin=-20, vmax=20)
+    axes[2, c].set_title(f"relative error [%]  median|e|={np.ma.median(np.abs(rel)):.2f}%", fontsize=9)
+    plt.colorbar(im, ax=axes[2, c], fraction=0.046, pad=0.02)
+    for r in range(3):
+        axes[r, c].axis("off")
+
+fig.suptitle(f"Error map: (restored - GT)/GT x 100  |  method = {METHOD_LABEL[BEST_METHOD]}", fontsize=13)
+fig.tight_layout(rect=(0, 0, 1, 0.95))
+fig.savefig(ERR_DIR / f"error_maps_{BEST_METHOD}.png", dpi=130, bbox_inches="tight")
+plt.show()
+print(f"저장: {ERR_DIR / f'error_maps_{BEST_METHOD}.png'}")
+
+# %% Cell 43 [markdown]
+### 8-4. 취약점 분석
+
+어떤 noise 와 어떤 영상에서 약한지 정량화한다. 발표의 "한계" 슬라이드 근거가 된다.
+
+# %% Cell 44 [code]
+_key = BEST_METHOD
+print(f"=== {METHOD_LABEL[_key]} 취약점 ===")
+print()
+print("[noise type 별]")
+_by = sorted(NOISE_NAMES, key=lambda t: np.mean([r[f"psnr_{_key}"] for r in rows if r["noise_type"] == t]))
+for _t in _by:
+    _v = [r[f"psnr_{_key}"] for r in rows if r["noise_type"] == _t]
+    _s = [r[f"ssim_{_key}"] for r in rows if r["noise_type"] == _t]
+    _in = [r["psnr_measure"] for r in rows if r["noise_type"] == _t]
+    print(f"  {_t:<18} PSNR {np.mean(_v):>7.3f} (입력 {np.mean(_in):>7.3f}, 개선 {np.mean(_v) - np.mean(_in):>+6.3f})  SSIM {np.mean(_s):.4f}")
+
+print()
+print("[하위 5장]")
+for r in sorted(rows, key=lambda r: r[f"psnr_{_key}"])[:5]:
+    _m = TEST_NOISE_META.get(r["file"], {})
+    print(f"  {r['file'][:34]:<36}{r['noise_type']:<18}sigma={_m.get('sigma', float('nan')):.4f}  PSNR {r[f'psnr_{_key}']:.3f}")
+
+print()
+print("[상위 5장]")
+for r in sorted(rows, key=lambda r: -r[f"psnr_{_key}"])[:5]:
+    _m = TEST_NOISE_META.get(r["file"], {})
+    print(f"  {r['file'][:34]:<36}{r['noise_type']:<18}sigma={_m.get('sigma', float('nan')):.4f}  PSNR {r[f'psnr_{_key}']:.3f}")
+
+# sigma 와 PSNR 의 관계
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
+for _t in NOISE_NAMES:
+    _x = [TEST_NOISE_META.get(r["file"], {}).get("sigma", np.nan) for r in rows if r["noise_type"] == _t]
+    _y = [r[f"psnr_{_key}"] for r in rows if r["noise_type"] == _t]
+    axes[0].scatter(_x, _y, s=22, alpha=0.75, label=_t)
+axes[0].set_xlabel("sigma")
+axes[0].set_ylabel("PSNR [dB]")
+axes[0].set_title(f"sigma vs PSNR ({METHOD_LABEL[_key]})")
+axes[0].grid(alpha=0.3)
+axes[0].legend(fontsize=8)
+
+_pos = np.arange(len(NOISE_NAMES))
+axes[1].boxplot([[r[f"psnr_{_key}"] for r in rows if r["noise_type"] == t] for t in NOISE_NAMES], positions=_pos, widths=0.6)
+axes[1].set_xticks(_pos)
+axes[1].set_xticklabels([t[:9] for t in NOISE_NAMES], fontsize=8)
+axes[1].set_ylabel("PSNR [dB]")
+axes[1].set_title("noise type 별 분포")
+axes[1].grid(alpha=0.3)
+fig.tight_layout()
+plt.show()
+
+# %% Cell 45 [markdown]
+## 9. 학습 곡선 & 요약
+
+# %% Cell 46 [code]
+if RESULTS:
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.4))
+    for _k, _r in RESULTS.items():
+        _h = [x for x in _r["history"] if "val_psnr" in x]
+        if not _h:
+            continue
+        _ep = [x["epoch"] for x in _h]
+        axes[0].plot(_ep, [x["val_psnr"] for x in _h], marker="o", ms=2.5, label=_k)
+        axes[1].plot([x["epoch"] for x in _r["history"]], [x["train_loss"] for x in _r["history"]], label=_k)
+        axes[2].plot([x["epoch"] for x in _r["history"]], [x["lr"] for x in _r["history"]], label=_k)
+    axes[0].set_title("stratified val PSNR")
+    axes[0].set_xlabel("epoch")
+    axes[0].set_ylabel("PSNR [dB]")
+    axes[1].set_title("train loss")
+    axes[1].set_xlabel("epoch")
+    axes[1].set_yscale("log")
+    axes[2].set_title("learning rate (cosine)")
+    axes[2].set_xlabel("epoch")
+    axes[2].set_yscale("log")
+    for a in axes:
+        a.grid(alpha=0.3)
+        a.legend(fontsize=8)
+    fig.tight_layout()
+    plt.show()
+
+    print()
+    print(f"{'run':<14}{'params':>12}{'best ep':>9}{'val PSNR':>11}{'test PSNR':>11}{'test SSIM':>11}")
+    print("-" * 68)
+    for _k, _r in RESULTS.items():
+        _tp = np.mean([r[f"psnr_{_k}"] for r in rows]) if f"psnr_{_k}" in rows[0] else float("nan")
+        _ts = np.mean([r[f"ssim_{_k}"] for r in rows]) if f"ssim_{_k}" in rows[0] else float("nan")
+        print(f"{_k:<14}{_r['params']:>12,}{_r['best']['epoch']:>9}{_r['best']['psnr']:>11.3f}{_tp:>11.3f}{_ts:>11.4f}")
+else:
+    print("학습된 모델이 없다. 7-1 셀을 실행할 것.")
+
+# %% Cell 47 [code]
+summary = {
+    "timestamp": datetime.now().isoformat(timespec="seconds"),
+    "config": {k: str(v) for k, v in asdict(config).items()},
+    "best_wiener_K": BEST_K,
+    "rule_compliance": {
+        "variant_mode": config.variant_mode,
+        "corrupted_per_clean": config.variant_pool if config.variant_mode == "pool" else "unbounded",
+        "limit": RULE_MAX_VARIANTS,
+        "compliant": config.variant_mode == "pool" and config.variant_pool <= RULE_MAX_VARIANTS,
+    },
+    "test": {
+        k: {
+            "psnr": round(float(np.mean([r[f"psnr_{k}"] for r in rows])), 3),
+            "ssim": round(float(np.mean([r[f"ssim_{k}"] for r in rows])), 4),
+            "per_noise_psnr": {
+                t: round(float(np.mean([r[f"psnr_{k}"] for r in rows if r["noise_type"] == t])), 3)
+                for t in NOISE_NAMES
+                if any(r["noise_type"] == t for r in rows)
+            },
+        }
+        for k in METHODS
+    },
+    "runs": {
+        k: {"run_dir": str(v["run_dir"]), "best": v["best"], "params": v["params"], "spec": v["spec"]}
+        for k, v in RESULTS.items()
+    },
+}
+_out = WORK_ROOT / "summary_iter1.json"
+_out.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+print(f"저장: {_out}")
+print()
+print(json.dumps(summary["test"], indent=2, ensure_ascii=False))
+
+# %% Cell 48 [markdown]
+## 10. 다음 단계
+
+이 노트북으로 얻은 수치를 보고 판단할 것.
+
+| 우선순위 | 항목 | 근거 |
+|---|---|---|
+| 1 | **C(phys_unet)가 conventional 을 못 넘으면** `phys_scale` 을 키우고 `dc_weight` 를 줄인다 | zero-init residual 이 학습되지 않은 것 |
+| 2 | **Rician 이 최하위면** variance-stabilizing transform 또는 bias 보정항 | `E[\|s+n\|] > s`, 신호 0 영역에서 `σ√(π/2)` bias |
+| 3 | **S&P 가 최하위면** median prefilter 를 모델 입력 채널에 추가 | impulse 는 detection 문제라 국소 median 이 강함 |
+| 4 | σ 조건부 입력 (FFDNet 방식) | 저노이즈 구간에서 상대 이득이 작은 문제 |
+| 5 | Label-free (Noise2Noise) | 가산점. `variant_pool` 의 같은 noise type 두 실현을 pair 로 쓰면 된다 |
+| 6 | Unrolled / physics DC step | 조교 `model_config` 에 `unroll_iters`, `phys_dc_steps` 흔적이 있다 |
+
+**발표 자료용으로 이미 확보되는 것**
+- 전체 파이프라인 구조 (2절 forward model + 6절 모델 표)
+- 복원 전/후 비교 (8-1) + zoom-in (8-2)
+- error map (8-3)
+- conventional 대비 정량 비교 (8절 표)
+- 취약점 분석 (8-4)
+- 방법론 선택 근거 (6절 C 를 넣는 이유 — iter1 의 실패 수치를 근거로 제시)
+

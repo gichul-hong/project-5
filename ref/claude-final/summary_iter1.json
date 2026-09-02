@@ -1,0 +1,147 @@
+{
+  "timestamp": "2026-09-02T14:34:06",
+  "config": {
+    "train_split": "train",
+    "valid_split": "val",
+    "test_measure_split": "test_deconv_noise",
+    "test_label_split": "test_label",
+    "test_blur_split": "test_deconv_only",
+    "variant_mode": "pool",
+    "variant_pool": "12",
+    "valid_l1_only": "True",
+    "val_sigma_levels": "1",
+    "valid_batch": "4",
+    "num_workers": "0",
+    "amp": "False",
+    "clip_output": "True",
+    "seed": "1234",
+    "max_train_images": "40",
+    "device": "cpu"
+  },
+  "best_wiener_K": {
+    "none": 0.03162277660168379,
+    "mean": 0.01,
+    "median": 0.01,
+    "adaptive": 0.01
+  },
+  "rule_compliance": {
+    "variant_mode": "pool",
+    "corrupted_per_clean": 12,
+    "limit": 12,
+    "compliant": true
+  },
+  "test": {
+    "measure": {
+      "psnr": 8.934,
+      "ssim": 0.0093,
+      "per_noise_psnr": {
+        "gaussian": 10.995,
+        "rician": 7.348,
+        "uniform": 10.008,
+        "salt_and_pepper": 7.898
+      }
+    },
+    "conv_none": {
+      "psnr": 15.67,
+      "ssim": 0.4534,
+      "per_noise_psnr": {
+        "gaussian": 15.87,
+        "rician": 13.173,
+        "uniform": 19.248,
+        "salt_and_pepper": 13.31
+      }
+    },
+    "conv_mean": {
+      "psnr": 20.313,
+      "ssim": 0.5744,
+      "per_noise_psnr": {
+        "gaussian": 22.011,
+        "rician": 16.554,
+        "uniform": 24.428,
+        "salt_and_pepper": 17.901
+      }
+    },
+    "conv_median": {
+      "psnr": 20.128,
+      "ssim": 0.5475,
+      "per_noise_psnr": {
+        "gaussian": 20.685,
+        "rician": 15.988,
+        "uniform": 24.076,
+        "salt_and_pepper": 19.955
+      }
+    },
+    "conv_adaptive": {
+      "psnr": 20.505,
+      "ssim": 0.5885,
+      "per_noise_psnr": {
+        "gaussian": 22.414,
+        "rician": 16.497,
+        "uniform": 25.068,
+        "salt_and_pepper": 17.487
+      }
+    },
+    "baseline_unet": {
+      "psnr": 25.8,
+      "ssim": 0.7859,
+      "per_noise_psnr": {
+        "gaussian": 35.259,
+        "rician": 21.196,
+        "uniform": 27.755,
+        "salt_and_pepper": 21.643
+      }
+    },
+    "phys_unet": {
+      "psnr": 15.698,
+      "ssim": 0.4538,
+      "per_noise_psnr": {
+        "gaussian": 15.888,
+        "rician": 13.185,
+        "uniform": 19.301,
+        "salt_and_pepper": 13.326
+      }
+    },
+    "phys_unet_tta": {
+      "psnr": 15.698,
+      "ssim": 0.4538,
+      "per_noise_psnr": {
+        "gaussian": 15.889,
+        "rician": 13.185,
+        "uniform": 19.301,
+        "salt_and_pepper": 13.326
+      }
+    }
+  },
+  "runs": {
+    "phys_unet": {
+      "run_dir": "C:\\hong\\project-5\\ref\\claude-final\\logs_final\\00009_phys_unet",
+      "best": {
+        "psnr": 14.450333983399148,
+        "ssim": 0.33234037444006304,
+        "epoch": 1
+      },
+      "params": 211401,
+      "spec": {
+        "key": "phys_unet",
+        "name": "C. Physics-residual U-Net (Wiener base)",
+        "arch": "phys_unet",
+        "target": "label",
+        "model_config": {
+          "phys_chans": 8,
+          "phys_scale": 0.1
+        },
+        "wiener_K": 0.03162277660168379,
+        "clean_branch_prob": 0.0,
+        "epochs": 1,
+        "batch": 4,
+        "lr": 0.0002,
+        "loss_model": "l1",
+        "ssim_weight": 0.1,
+        "dc_weight": 0.05,
+        "lr_schedule": "cosine",
+        "early_stop_patience": 99,
+        "grad_clip": 1.0
+      }
+    }
+  }
+}
