@@ -11,6 +11,11 @@ openrouter_balance.html
 ref/dataset/
 dataset/
 
+# 로컬 실행 산출물 (ROOT 자동탐색이 ref/ 로 떨어질 때 생성됨)
+ref/claude-final/
+logs_final/
+*.ckpt
+
 # System & IDE files
 .DS_Store
 Thumbs.db
